@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 4.5 轻量级虚影避障系统 - 资源优化版
-- 轻量级A*路径规划
-- 优化虚影资源管理，防止内存泄漏
-- 简化物理禁用，提高稳定性
-- 减少虚影数量，降低资源占用
-- 虚影灰色透明外观，无物理属性
+Isaac Sim 4.5 轻量级虚影避障系统 - 稳定优化版
+- 改进机器人运动控制，解决卡顿问题
+- 优化轮子控制，实现稳定直线运动
+- 修复虚影位置同步问题
+- 移除有问题的路径线功能
+- 添加运动平滑和稳定性辅助措施
+- 修复垃圾对象移除问题，避免物理仿真破坏
 """
 
 from isaacsim import SimulationApp
@@ -14,7 +15,7 @@ simulation_app = SimulationApp({
     "enable_livestream": False, 
     "enable_cameras": True,
     "enable_rtx": True,
-    "physics_dt": 1.0/120.0,
+    "physics_dt": 1.0/120.0,  # 保持高频物理
     "rendering_dt": 1.0/60.0,
 })
 
@@ -192,7 +193,7 @@ class LightweightPathPlanner:
         return path
 
 class EfficientGhostManager:
-    """高效虚影管理器 - 专用无物理资产"""
+    """高效虚影管理器 - 移除路径线功能"""
     
     def __init__(self, world: World):
         self.world = world
@@ -200,7 +201,6 @@ class EfficientGhostManager:
         self.ghost_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm3.usd"   # 虚影专用
         self.ghost_container_path = "/World/GhostVisualization"
         self.active_ghosts = {}
-        self.path_lines = {}
         self.max_ghosts_per_target = 6
         print("👻 虚影管理器初始化 - 专用无物理资产")
     
@@ -223,7 +223,8 @@ class EfficientGhostManager:
                 break
         
         self.active_ghosts[target_index] = ghost_prims
-        self._create_simple_path_lines(target_index, path_nodes)
+        # 移除路径线创建，避免物理错误
+        # self._create_simple_path_lines(target_index, path_nodes)
         
         print(f"   完成: {len(ghost_prims)} 个无物理虚影")
         
@@ -293,91 +294,6 @@ class EfficientGhostManager:
             rotate_op = xform.AddRotateZOp()
             rotate_op.Set(yaw_degrees)
     
-    def _disable_physics_completely(self, ghost_prim):
-        """完全禁用物理属性 - 修正版"""
-        stage = self.world.stage
-        
-        # 等待加载
-        for _ in range(5):
-            self.world.step(render=False)
-        
-        try:
-            # 移除所有物理相关的API - 使用存在的API
-            physics_apis = [
-                UsdPhysics.ArticulationRootAPI,
-                UsdPhysics.RigidBodyAPI,
-                UsdPhysics.CollisionAPI,
-                UsdPhysics.MassAPI,
-                UsdPhysics.RevoluteJointAPI,
-                UsdPhysics.PrismaticJointAPI,
-                UsdPhysics.DriveAPI
-            ]
-            
-            # 遍历所有子prim
-            for prim in Usd.PrimRange(ghost_prim):
-                try:
-                    # 移除物理API
-                    for api_class in physics_apis:
-                        if hasattr(api_class, 'Get') and api_class.Get(prim):
-                            prim.RemoveAPI(api_class)
-                    
-                    # 强制移除所有物理属性
-                    physics_attrs = [
-                        "physics:rigidBodyEnabled",
-                        "physics:collisionEnabled", 
-                        "physics:kinematicEnabled",
-                        "physics:mass",
-                        "physics:density",
-                        "physics:simulationOwner",
-                        "drive:angular:physics:damping",
-                        "drive:angular:physics:stiffness",
-                        "drive:linear:physics:damping", 
-                        "drive:linear:physics:stiffness",
-                        "physics:body0",
-                        "physics:body1",
-                        "physics:localPos0",
-                        "physics:localPos1",
-                        "physics:localRot0", 
-                        "physics:localRot1"
-                    ]
-                    
-                    for attr_name in physics_attrs:
-                        if prim.HasAttribute(attr_name):
-                            prim.RemoveProperty(attr_name)
-                    
-                    # 对于Mesh设置为纯可视化
-                    if prim.IsA(UsdGeom.Mesh):
-                        # 设置为引导用途，不参与物理计算
-                        purpose_attr = prim.CreateAttribute("purpose", Sdf.ValueTypeNames.Token)
-                        purpose_attr.Set("guide")
-                        
-                        # 明确禁用物理
-                        prim.CreateAttribute("physics:rigidBodyEnabled", Sdf.ValueTypeNames.Bool).Set(False)
-                        prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool).Set(False)
-                
-                except Exception as e:
-                    continue  # 忽略单个prim的错误，继续处理
-            
-            # 设置整个虚影为非物理对象
-            ghost_prim.CreateAttribute("physics:rigidBodyEnabled", Sdf.ValueTypeNames.Bool).Set(False)
-            ghost_prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool).Set(False)
-            ghost_prim.CreateAttribute("physics:kinematicEnabled", Sdf.ValueTypeNames.Bool).Set(False)
-            ghost_prim.CreateAttribute("physics:simulationOwner", Sdf.ValueTypeNames.String).Set("")
-            
-            # 设置为引导对象
-            ghost_prim.CreateAttribute("purpose", Sdf.ValueTypeNames.Token).Set("guide")
-            
-            print(f"   完全禁用虚影物理属性: {ghost_prim.GetPath()}")
-            
-        except Exception as e:
-            print(f"   物理禁用过程中出现错误: {e}")
-            # 即使出错也要确保基本的物理禁用
-            try:
-                ghost_prim.CreateAttribute("physics:rigidBodyEnabled", Sdf.ValueTypeNames.Bool).Set(False)
-                ghost_prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool).Set(False)
-            except:
-                pass
-    
     def _set_arm_pose_simple(self, ghost_prim, arm_config: List[float]):
         """简化机械臂姿态设置"""
         if len(arm_config) < 7:
@@ -405,7 +321,7 @@ class EfficientGhostManager:
                 rot_op.Set(float(np.degrees(angle)))
     
     def _apply_gray_transparency(self, ghost_prim, ghost_index: int):
-        """应用灰色透明外观 - 修正版"""
+        """应用灰色透明外观"""
         # 灰色系颜色 - 从浅灰到深灰
         gray_values = [0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
         gray_value = gray_values[ghost_index % len(gray_values)]
@@ -420,7 +336,7 @@ class EfficientGhostManager:
             # 处理所有mesh组件
             mesh_count = 0
             for prim in Usd.PrimRange(ghost_prim):
-                if prim.IsA(UsdGeom.Mesh) and mesh_count < 50:  # 增加处理数量
+                if prim.IsA(UsdGeom.Mesh) and mesh_count < 50:
                     try:
                         mesh = UsdGeom.Mesh(prim)
                         
@@ -454,7 +370,6 @@ class EfficientGhostManager:
                         mesh_count += 1
                         
                     except Exception as e:
-                        print(f"     设置mesh外观失败: {e}")
                         continue
             
             print(f"   成功设置 {mesh_count} 个mesh为灰色透明")
@@ -472,42 +387,6 @@ class EfficientGhostManager:
             except:
                 pass
     
-    def _create_simple_path_lines(self, target_index: int, path_nodes: List[PathNode]):
-        """创建简化路径线"""
-        if len(path_nodes) < 2:
-            return
-        
-        path_lines = []
-        
-        # 只创建几条关键路径线 - 也使用灰色
-        key_indices = [0, len(path_nodes)//2, len(path_nodes)-1]
-        
-        for i in range(len(key_indices) - 1):
-            start_idx = key_indices[i]
-            end_idx = key_indices[i + 1]
-            
-            if start_idx < len(path_nodes) and end_idx < len(path_nodes):
-                start_pos = path_nodes[start_idx].position
-                end_pos = path_nodes[end_idx].position
-                
-                midpoint = (start_pos + end_pos) / 2
-                direction = end_pos - start_pos
-                length = np.linalg.norm(direction)
-                
-                if length > 0.1:
-                    line_vis = DynamicCuboid(
-                        prim_path=f"/World/PathLine_Target_{target_index}_Segment_{i}",
-                        name=f"path_line_target_{target_index}_segment_{i}",
-                        position=midpoint + np.array([0, 0, 0.02]),
-                        scale=np.array([length, 0.03, 0.01]),
-                        color=np.array([0.6, 0.6, 0.6])  # 灰色路径线
-                    )
-                    
-                    self.world.scene.add(line_vis)
-                    path_lines.append(line_vis)
-        
-        self.path_lines[target_index] = path_lines
-    
     def _cleanup_previous_ghosts(self):
         """清理之前的虚影"""
         stage = self.world.stage
@@ -516,15 +395,7 @@ class EfficientGhostManager:
             stage.RemovePrim(self.ghost_container_path)
             self.world.step(render=False)
         
-        for target_index in list(self.path_lines.keys()):
-            for line_obj in self.path_lines[target_index]:
-                try:
-                    self.world.scene.remove_object(line_obj.name)
-                except:
-                    pass
-        
         self.active_ghosts.clear()
-        self.path_lines.clear()
     
     def clear_target_ghosts(self, target_index: int):
         """清除目标虚影"""
@@ -534,14 +405,6 @@ class EfficientGhostManager:
                 if stage.GetPrimAtPath(ghost_prim.GetPath()):
                     stage.RemovePrim(ghost_prim.GetPath())
             del self.active_ghosts[target_index]
-        
-        if target_index in self.path_lines:
-            for line_obj in self.path_lines[target_index]:
-                try:
-                    self.world.scene.remove_object(line_obj.name)
-                except:
-                    pass
-            del self.path_lines[target_index]
         
         self.world.step(render=False)
     
@@ -555,20 +418,158 @@ class EfficientGhostManager:
         """清理所有资源"""
         self._cleanup_previous_ghosts()
 
+class StabilizedRobotController:
+    """稳定化机器人控制器 - 解决运动问题"""
+    
+    def __init__(self, mobile_base, differential_controller):
+        self.mobile_base = mobile_base
+        self.differential_controller = differential_controller
+        
+        # 改进的控制参数 - 大幅提高转弯速度
+        self.max_linear_velocity = 0.25  
+        self.max_angular_velocity = 5.0  # 提高约8倍：0.6 → 5.0
+        
+        # 运动平滑参数
+        self.velocity_filter = deque(maxlen=5)
+        self.angular_filter = deque(maxlen=5)
+        
+        # 稳定性检查 - 适应高速转弯
+        self.last_position = None
+        self.stuck_counter = 0
+        self.stuck_threshold = 40  # 降低阈值，因为高速转弯时间更短
+        
+        # 控制历史
+        self.control_history = deque(maxlen=10)
+        
+        print("🎮 稳定化控制器初始化")
+    
+    def send_stable_command(self, target_linear_vel: float, target_angular_vel: float):
+        """发送稳定的控制命令"""
+        # 速度限制
+        target_linear_vel = np.clip(target_linear_vel, -self.max_linear_velocity, self.max_linear_velocity)
+        target_angular_vel = np.clip(target_angular_vel, -self.max_angular_velocity, self.max_angular_velocity)
+        
+        # 速度平滑
+        self.velocity_filter.append(target_linear_vel)
+        self.angular_filter.append(target_angular_vel)
+        
+        smooth_linear = np.mean(list(self.velocity_filter))
+        smooth_angular = np.mean(list(self.angular_filter))
+        
+        # 记录控制历史
+        self.control_history.append((smooth_linear, smooth_angular))
+        
+        # 发送控制命令
+        self._apply_wheel_control(smooth_linear, smooth_angular)
+    
+    def _apply_wheel_control(self, linear_vel: float, angular_vel: float):
+        """应用轮子控制 - 改进版"""
+        try:
+            articulation_controller = self.mobile_base.get_articulation_controller()
+            
+            # 物理参数 - 来自Create-3规格
+            wheel_radius = 0.036  # 3.6cm
+            wheel_base = 0.235    # 23.5cm
+            
+            # 计算轮子速度
+            left_wheel_vel = (linear_vel - angular_vel * wheel_base / 2.0) / wheel_radius
+            right_wheel_vel = (linear_vel + angular_vel * wheel_base / 2.0) / wheel_radius
+            
+            # 对称性检查 - 确保直线运动时两轮速度相等
+            if abs(angular_vel) < 0.05:  # 基本直线运动
+                avg_vel = (left_wheel_vel + right_wheel_vel) / 2.0
+                left_wheel_vel = avg_vel
+                right_wheel_vel = avg_vel
+            
+            # 创建关节动作
+            num_dofs = len(self.mobile_base.dof_names)
+            joint_velocities = torch.zeros(num_dofs, dtype=torch.float32)
+            
+            # 设置轮子速度
+            try:
+                left_wheel_idx = self.mobile_base.dof_names.index("left_wheel_joint")
+                right_wheel_idx = self.mobile_base.dof_names.index("right_wheel_joint")
+                
+                joint_velocities[left_wheel_idx] = float(left_wheel_vel)
+                joint_velocities[right_wheel_idx] = float(right_wheel_vel)
+                
+                # 应用动作
+                action = ArticulationAction(joint_velocities=joint_velocities)
+                articulation_controller.apply_action(action)
+                
+            except (ValueError, IndexError) as e:
+                print(f"   轮子控制错误: {e}")
+                
+        except Exception as e:
+            if "invalidated" in str(e) or "backend" in str(e):
+                # 物理仿真视图无效化，跳过控制
+                pass
+            else:
+                print(f"   控制应用失败: {e}")
+    
+    def check_movement_stability(self, current_position: np.ndarray) -> bool:
+        """检查运动稳定性 - 改进版"""
+        if self.last_position is not None:
+            movement = np.linalg.norm(current_position[:2] - self.last_position[:2])
+            
+            # 更宽松的卡住检测
+            if movement < 0.005:  # 进一步降低敏感度
+                self.stuck_counter += 1
+            else:
+                self.stuck_counter = 0
+            
+            # 增加卡住判定时间
+            if self.stuck_counter >= self.stuck_threshold:
+                print("   检测到机器人长时间卡住，尝试恢复...")
+                self._unstuck_recovery()
+                self.stuck_counter = 0
+                return False
+        
+        self.last_position = current_position.copy()
+        return True
+    
+    def _unstuck_recovery(self):
+        """解卡恢复 - 增强版"""
+        print("   执行解卡恢复...")
+        
+        # 1. 完全停止
+        for _ in range(10):
+            self.send_stable_command(0.0, 0.0)
+        
+        # 2. 尝试多方向小幅移动 - 高速转弯版
+        recovery_actions = [
+            (-0.1, 0.0),   # 后退
+            (0.0, 3.0),    # 高速左转
+            (0.0, -3.0),   # 高速右转
+            (-0.08, 2.0),  # 后退+高速左转
+            (-0.08, -2.0), # 后退+高速右转
+        ]
+        
+        for linear, angular in recovery_actions:
+            for _ in range(8):
+                self.send_stable_command(linear, angular)
+            # 短暂停止
+            for _ in range(3):
+                self.send_stable_command(0.0, 0.0)
+        
+        # 3. 最终停止
+        for _ in range(8):
+            self.send_stable_command(0.0, 0.0)
+        
+        print("   解卡恢复完成")
+
 class LightweightRobotSystem:
-    """轻量级机器人系统"""
+    """轻量级机器人系统 - 优化版"""
     
     def __init__(self):
         self.world = None
         self.robot_prim_path = "/World/create3_robot"
         self.mobile_base = None
         self.differential_controller = None
+        self.stabilized_controller = None  # 新增稳定控制器
+        
         self.current_position = np.array([0.0, 0.0, 0.0])
         self.current_orientation = 0.0
-        
-        # 运动参数
-        self.max_linear_velocity = 0.35
-        self.max_angular_velocity = 0.9
         
         # 垃圾对象
         self.small_trash_objects = []
@@ -598,34 +599,51 @@ class LightweightRobotSystem:
         """初始化系统"""
         print("🚀 初始化轻量级Isaac Sim 4.5环境...")
         
-        self.world = World(
-            stage_units_in_meters=1.0,
-            physics_dt=1.0/120.0,
-            rendering_dt=1.0/60.0
-        )
-        self.world.scene.clear()
-        
-        # 物理设置
-        physics_context = self.world.get_physics_context()
-        physics_context.set_gravity(-9.81)
-        physics_context.set_solver_type("TGS")
-        physics_context.enable_gpu_dynamics(True)
-        
-        # 创建地面
-        ground = FixedCuboid(
-            prim_path="/World/Ground",
-            name="ground", 
-            position=np.array([0.0, 0.0, -0.5]),
-            scale=np.array([50.0, 50.0, 1.0]),
-            color=np.array([0.5, 0.5, 0.5])
-        )
-        self.world.scene.add(ground)
-        
-        self._setup_lighting()
-        self._initialize_systems()
-        
-        print("✅ 轻量级环境初始化完成")
-        return True
+        try:
+            self.world = World(
+                stage_units_in_meters=1.0,
+                physics_dt=1.0/120.0,
+                rendering_dt=1.0/60.0
+            )
+            self.world.scene.clear()
+            
+            # 优化物理设置
+            physics_context = self.world.get_physics_context()
+            physics_context.set_gravity(-9.81)
+            physics_context.set_solver_type("TGS")
+            physics_context.enable_gpu_dynamics(True)
+            
+            # Isaac Sim 4.5兼容的稳定性设置
+            try:
+                # 尝试设置求解器参数（如果方法存在）
+                if hasattr(physics_context, 'set_solver_position_iteration_count'):
+                    physics_context.set_solver_position_iteration_count(8)
+                if hasattr(physics_context, 'set_solver_velocity_iteration_count'):
+                    physics_context.set_solver_velocity_iteration_count(4)
+            except Exception as e:
+                print(f"   物理参数设置跳过: {e}")
+            
+            # 创建地面
+            ground = FixedCuboid(
+                prim_path="/World/Ground",
+                name="ground", 
+                position=np.array([0.0, 0.0, -0.5]),
+                scale=np.array([50.0, 50.0, 1.0]),
+                color=np.array([0.5, 0.5, 0.5])
+            )
+            self.world.scene.add(ground)
+            
+            self._setup_lighting()
+            self._initialize_systems()
+            
+            print("✅ 轻量级环境初始化完成")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 系统初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     def _setup_lighting(self):
         """设置照明"""
@@ -684,76 +702,113 @@ class LightweightRobotSystem:
         """初始化机器人"""
         print("🤖 初始化Create-3+机械臂...")
         
-        # 使用有物理属性的实际机器人资产
-        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm2.usd"
-        
-        self.mobile_base = WheeledRobot(
-            prim_path=self.robot_prim_path,
-            name="create3_robot",
-            wheel_dof_names=["left_wheel_joint", "right_wheel_joint"],
-            create_robot=True,
-            usd_path=robot_usd_path,
-            position=np.array([0.0, 0.0, 0.0])
-        )
-        
-        self.world.scene.add(self.mobile_base)
-        
-        self.differential_controller = DifferentialController(
-            name="create3_controller",
-            wheel_radius=0.036,
-            wheel_base=0.235,
-            max_linear_speed=self.max_linear_velocity,
-            max_angular_speed=self.max_angular_velocity
-        )
-        
-        print("✅ 机器人初始化成功")
-        return True
+        try:
+            # 使用有物理属性的实际机器人资产
+            robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm2.usd"
+            
+            self.mobile_base = WheeledRobot(
+                prim_path=self.robot_prim_path,
+                name="create3_robot",
+                wheel_dof_names=["left_wheel_joint", "right_wheel_joint"],
+                create_robot=True,
+                usd_path=robot_usd_path,
+                position=np.array([0.0, 0.0, 0.0])
+            )
+            
+            self.world.scene.add(self.mobile_base)
+            
+            self.differential_controller = DifferentialController(
+                name="create3_controller",
+                wheel_radius=0.036,
+                wheel_base=0.235,
+                max_linear_speed=0.25,  
+                max_angular_speed=5.0  # 大幅提高角速度
+            )
+            
+            print("✅ 机器人初始化成功")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 机器人初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     def setup_post_load(self):
         """后加载设置"""
         print("🔧 后加载设置...")
         
-        self.world.reset()
-        
-        for _ in range(30):
-            self.world.step(render=False)
-        
-        self.mobile_base = self.world.scene.get_object("create3_robot")
-        self._setup_control()
-        self._move_arm_to_pose("home")
-        
-        print("✅ 后加载设置完成")
-        return True
+        try:
+            self.world.reset()
+            
+            # 额外稳定步骤
+            for _ in range(50):  # 增加稳定步数
+                self.world.step(render=False)
+            
+            self.mobile_base = self.world.scene.get_object("create3_robot")
+            if self.mobile_base is None:
+                raise Exception("无法获取机器人对象")
+                
+            self._setup_improved_control()
+            self._move_arm_to_pose("home")
+            
+            # 初始化稳定控制器
+            self.stabilized_controller = StabilizedRobotController(
+                self.mobile_base, self.differential_controller
+            )
+            
+            print("✅ 后加载设置完成")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 后加载设置失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
-    def _setup_control(self):
-        """设置控制"""
-        articulation_controller = self.mobile_base.get_articulation_controller()
-        num_dofs = len(self.mobile_base.dof_names)
-        
-        kp = torch.zeros(num_dofs, dtype=torch.float32)
-        kd = torch.zeros(num_dofs, dtype=torch.float32)
-        
-        # 轮子控制
-        for wheel_name in ["left_wheel_joint", "right_wheel_joint"]:
-            idx = self.mobile_base.dof_names.index(wheel_name)
-            kp[idx] = 0.0
-            kd[idx] = 800.0
-        
-        # 机械臂控制
-        arm_joint_names = [f"panda_joint{i+1}" for i in range(7)]
-        for joint_name in arm_joint_names:
-            idx = self.mobile_base.dof_names.index(joint_name)
-            kp[idx] = 1000.0
-            kd[idx] = 50.0
-        
-        # 夹爪控制
-        for joint_name in ["panda_finger_joint1", "panda_finger_joint2"]:
-            idx = self.mobile_base.dof_names.index(joint_name)
-            kp[idx] = 2e5
-            kd[idx] = 2e3
-        
-        articulation_controller.set_gains(kps=kp, kds=kd)
-        print("   关节控制参数设置完成")
+    def _setup_improved_control(self):
+        """设置改进的控制"""
+        try:
+            articulation_controller = self.mobile_base.get_articulation_controller()
+            num_dofs = len(self.mobile_base.dof_names)
+            
+            kp = torch.zeros(num_dofs, dtype=torch.float32)
+            kd = torch.zeros(num_dofs, dtype=torch.float32)
+            
+            # 轮子控制 - 降低阻尼，提高响应性
+            for wheel_name in ["left_wheel_joint", "right_wheel_joint"]:
+                try:
+                    idx = self.mobile_base.dof_names.index(wheel_name)
+                    kp[idx] = 0.0
+                    kd[idx] = 600.0  # 降低阻尼
+                except ValueError:
+                    print(f"   轮子关节 {wheel_name} 未找到")
+            
+            # 机械臂控制
+            arm_joint_names = [f"panda_joint{i+1}" for i in range(7)]
+            for joint_name in arm_joint_names:
+                try:
+                    idx = self.mobile_base.dof_names.index(joint_name)
+                    kp[idx] = 1000.0
+                    kd[idx] = 50.0
+                except ValueError:
+                    print(f"   机械臂关节 {joint_name} 未找到")
+            
+            # 夹爪控制
+            for joint_name in ["panda_finger_joint1", "panda_finger_joint2"]:
+                try:
+                    idx = self.mobile_base.dof_names.index(joint_name)
+                    kp[idx] = 2e5
+                    kd[idx] = 2e3
+                except ValueError:
+                    print(f"   夹爪关节 {joint_name} 未找到")
+            
+            articulation_controller.set_gains(kps=kp, kds=kd)
+            print("   改进的关节控制参数设置完成")
+            
+        except Exception as e:
+            print(f"   控制设置错误: {e}")
+            raise
     
     def _move_arm_to_pose(self, pose_name):
         """移动机械臂到姿态"""
@@ -793,15 +848,27 @@ class LightweightRobotSystem:
             self.world.step(render=False)
     
     def get_robot_pose(self):
-        """获取机器人姿态"""
-        position, orientation = self.mobile_base.get_world_pose()
-        quat = np.array([orientation[1], orientation[2], orientation[3], orientation[0]])
-        r = R.from_quat(quat)
-        yaw = r.as_euler('xyz')[2]
-        
-        self.current_position = position
-        self.current_orientation = yaw
-        return position.copy(), yaw
+        """获取机器人姿态 - 改进版"""
+        try:
+            position, orientation = self.mobile_base.get_world_pose()
+            
+            # 确保position是numpy数组
+            if not isinstance(position, np.ndarray):
+                position = np.array(position)
+            
+            # 四元数转欧拉角
+            quat = np.array([orientation[1], orientation[2], orientation[3], orientation[0]])
+            r = R.from_quat(quat)
+            yaw = r.as_euler('xyz')[2]
+            
+            self.current_position = position
+            self.current_orientation = yaw
+            
+            return position.copy(), yaw
+            
+        except Exception as e:
+            print(f"   位置获取错误: {e}")
+            return self.current_position.copy(), self.current_orientation
     
     def create_trash_environment(self):
         """创建垃圾环境"""
@@ -883,16 +950,20 @@ class LightweightRobotSystem:
         print(f"✅ 轻量级任务规划完成: {len(self.all_tasks)}个目标")
     
     def _plan_lightweight_paths(self):
-        """轻量级路径规划"""
+        """轻量级路径规划 - 改进版"""
         print("🗺️ 轻量级路径规划...")
         
-        current_pos, _ = self.get_robot_pose()
+        current_pos, current_yaw = self.get_robot_pose()
         
         for target_index, task in enumerate(self.all_tasks):
             print(f"   规划目标 {target_index}: {task.target_name}")
             
             target_pos = task.target_position.copy()
             target_pos[2] = 0.0
+            
+            # 打印起始和目标位置
+            print(f"     起始: [{current_pos[0]:.2f}, {current_pos[1]:.2f}]")
+            print(f"     目标: [{target_pos[0]:.2f}, {target_pos[1]:.2f}]")
             
             # 使用轻量级路径规划
             safe_path = self.path_planner.find_safe_path(current_pos, target_pos)
@@ -904,12 +975,15 @@ class LightweightRobotSystem:
                     direction = np.array(safe_path[i + 1]) - np.array(point)
                     orientation = np.arctan2(direction[1], direction[0])
                 else:
-                    orientation = path_nodes[-1].orientation if path_nodes else 0.0
+                    orientation = path_nodes[-1].orientation if path_nodes else current_yaw
                 
                 arm_config = self.arm_poses[task.approach_pose]
                 
+                # 确保虚影位置与规划路径一致
+                node_position = np.array([point[0], point[1], 0.0])
+                
                 node = PathNode(
-                    position=np.array([point[0], point[1], 0.0]),
+                    position=node_position,
                     orientation=orientation,
                     arm_config=arm_config.copy(),
                     gripper_state=self.gripper_open,
@@ -921,9 +995,15 @@ class LightweightRobotSystem:
                 path_nodes.append(node)
             
             self.target_paths[target_index] = path_nodes
-            current_pos = target_pos
+            
+            # 更新当前位置为目标位置，准备下一次规划
+            current_pos = target_pos.copy()
             
             print(f"     生成安全路径: {len(path_nodes)} 个节点")
+            
+            # 打印前几个节点的位置用于调试
+            for j, node in enumerate(path_nodes[:3]):
+                print(f"       节点{j}: [{node.position[0]:.2f}, {node.position[1]:.2f}]")
     
     def execute_lightweight_mission(self):
         """执行轻量级任务"""
@@ -931,6 +1011,11 @@ class LightweightRobotSystem:
         
         for target_index, task in enumerate(self.all_tasks):
             print(f"\n🎯 执行目标 {target_index}: {task.target_name}")
+            
+            # 在执行新目标前，获取当前位置信息
+            current_pos, current_yaw = self.get_robot_pose()
+            print(f"   当前机器人位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}], 朝向: {np.degrees(current_yaw):.1f}°")
+            print(f"   目标位置: [{task.target_position[0]:.3f}, {task.target_position[1]:.3f}]")
             
             # 获取路径
             path_nodes = self.target_paths[target_index]
@@ -945,7 +1030,7 @@ class LightweightRobotSystem:
             
             # 执行路径
             print(f"🏃 执行路径（{len(path_nodes)}个节点）...")
-            self._execute_lightweight_path(path_nodes, task)
+            self._execute_stable_path(path_nodes, task)
             
             # 清除虚影
             self.ghost_manager.clear_target_ghosts(target_index)
@@ -959,17 +1044,26 @@ class LightweightRobotSystem:
         print("\n🎉 所有目标执行完成!")
         self._show_results()
     
-    def _execute_lightweight_path(self, path_nodes: List[PathNode], task: TaskInfo):
-        """执行轻量级路径"""
+    def _execute_stable_path(self, path_nodes: List[PathNode], task: TaskInfo):
+        """执行稳定路径 - 改进版"""
         for i, node in enumerate(path_nodes):
-            # 导航到节点
-            self._navigate_to_node_efficiently(node, tolerance=0.2)
+            # 稳定导航到节点
+            success = self._navigate_to_node_stable(node, tolerance=0.15)
+            
+            if not success:
+                print(f"   节点 {i} 导航失败，尝试继续...")
+                continue
             
             # 检查任务完成
             task_distance = np.linalg.norm(node.position[:2] - task.target_position[:2])
             if task_distance < 0.4 and task.target_name not in self.collected_objects:
                 print(f"🎯 到达任务目标: {task.target_name}")
                 self._execute_task_action(task)
+                
+                # 任务完成后的位置校准和稳定
+                print(f"   任务完成，进行位置校准...")
+                self._post_task_calibration()
+                
                 return True
             
             # 进度显示
@@ -979,66 +1073,70 @@ class LightweightRobotSystem:
         
         return True
     
-    def _navigate_to_node_efficiently(self, node: PathNode, tolerance: float = 0.2):
-        """高效导航到节点"""
-        max_time = 8.0
+    def _navigate_to_node_stable(self, node: PathNode, tolerance: float = 0.15) -> bool:
+        """稳定导航到节点 - 改进转弯控制"""
+        max_time = 12.0  # 增加最大时间
         start_time = time.time()
         
+        print(f"   导航到节点: [{node.position[0]:.2f}, {node.position[1]:.2f}]")
+        
         while time.time() - start_time < max_time:
-            current_pos, current_yaw = self.get_robot_pose()
-            
-            # 检查到达
-            distance = np.linalg.norm(current_pos[:2] - node.position[:2])
-            if distance < tolerance:
-                return True
-            
-            # 计算控制量
-            direction = node.position[:2] - current_pos[:2]
-            target_angle = np.arctan2(direction[1], direction[0])
-            angle_diff = target_angle - current_yaw
-            
-            # 角度归一化
-            while angle_diff > np.pi:
-                angle_diff -= 2 * np.pi
-            while angle_diff < -np.pi:
-                angle_diff += 2 * np.pi
-            
-            # 高效控制
-            if abs(angle_diff) > 0.2:
-                linear_vel = 0.0
-                angular_vel = np.clip(angle_diff * 1.8, -0.7, 0.7)
-            else:
-                linear_vel = min(0.3, max(0.08, distance * 0.4))
-                angular_vel = np.clip(angle_diff * 0.8, -0.3, 0.3)
-            
-            self._send_control_command(linear_vel, angular_vel)
-            self.world.step(render=True)
+            try:
+                current_pos, current_yaw = self.get_robot_pose()
+                
+                # 检查到达
+                distance = np.linalg.norm(current_pos[:2] - node.position[:2])
+                if distance < tolerance:
+                    # 停止机器人
+                    self.stabilized_controller.send_stable_command(0.0, 0.0)
+                    print(f"   成功到达节点，距离: {distance:.3f}m")
+                    return True
+                
+                # 计算控制量
+                direction = node.position[:2] - current_pos[:2]
+                target_angle = np.arctan2(direction[1], direction[0])
+                angle_diff = target_angle - current_yaw
+                
+                # 角度归一化
+                while angle_diff > np.pi:
+                    angle_diff -= 2 * np.pi
+                while angle_diff < -np.pi:
+                    angle_diff += 2 * np.pi
+                
+                # 改进的控制策略 - 高速转弯
+                if abs(angle_diff) > 0.1:  # 降低转弯阈值
+                    # 纯转弯，大幅提高角速度
+                    linear_vel = 0.0
+                    angular_vel = np.clip(angle_diff * 15.0, -4.5, 4.5)  # 增益提高约7.5倍
+                    print(f"   高速转弯: 角度差={np.degrees(angle_diff):.1f}°, 角速度={angular_vel:.2f}")
+                else:
+                    # 前进，但保持一定的角度修正
+                    linear_vel = min(0.2, max(0.06, distance * 0.6))
+                    angular_vel = np.clip(angle_diff * 8.0, -2.0, 2.0)  # 前进时的角度修正也提高
+                    print(f"   前进: 距离={distance:.2f}m, 线速度={linear_vel:.2f}")
+                
+                # 发送稳定控制命令
+                self.stabilized_controller.send_stable_command(linear_vel, angular_vel)
+                
+                # 检查稳定性（但不要太频繁干扰）
+                if not self.stabilized_controller.check_movement_stability(current_pos):
+                    print(f"   稳定性检查失败，重置控制")
+                    # 短暂停止后继续
+                    for _ in range(3):
+                        self.stabilized_controller.send_stable_command(0.0, 0.0)
+                        self.world.step(render=True)
+                
+                # 步进仿真
+                self.world.step(render=True)
+                
+            except Exception as e:
+                print(f"   导航异常: {e}")
+                continue
         
-        return True
-    
-    def _send_control_command(self, linear_vel, angular_vel):
-        """发送控制命令"""
-        linear_vel = np.clip(linear_vel, -self.max_linear_velocity, self.max_linear_velocity)
-        angular_vel = np.clip(angular_vel, -self.max_angular_velocity, self.max_angular_velocity)
-        
-        articulation_controller = self.mobile_base.get_articulation_controller()
-        wheel_radius = 0.036
-        wheel_base = 0.235
-        
-        left_wheel_vel = (linear_vel - angular_vel * wheel_base / 2.0) / wheel_radius
-        right_wheel_vel = (linear_vel + angular_vel * wheel_base / 2.0) / wheel_radius
-        
-        num_dofs = len(self.mobile_base.dof_names)
-        joint_velocities = torch.zeros(num_dofs, dtype=torch.float32)
-        
-        left_wheel_idx = self.mobile_base.dof_names.index("left_wheel_joint")
-        right_wheel_idx = self.mobile_base.dof_names.index("right_wheel_joint")
-        
-        joint_velocities[left_wheel_idx] = left_wheel_vel
-        joint_velocities[right_wheel_idx] = right_wheel_vel
-        
-        action = ArticulationAction(joint_velocities=joint_velocities)
-        articulation_controller.apply_action(action)
+        # 超时停止
+        print(f"   导航超时，当前距离: {distance:.3f}m")
+        self.stabilized_controller.send_stable_command(0.0, 0.0)
+        return False
     
     def _execute_task_action(self, task: TaskInfo):
         """执行任务动作"""
@@ -1057,8 +1155,8 @@ class LightweightRobotSystem:
         
         for trash in self.small_trash_objects:
             if trash.name == task.target_name:
-                current_pos, _ = self.get_robot_pose()
-                trash.set_world_pose(current_pos, np.array([0, 0, 0, 1]))
+                # 安全处理垃圾对象
+                self._safely_remove_trash(trash)
                 self.collected_objects.append(task.target_name)
                 print(f"✅ {task.target_name} 收集成功!")
                 break
@@ -1073,16 +1171,110 @@ class LightweightRobotSystem:
         
         for trash in self.large_trash_objects:
             if trash.name == task.target_name:
-                trash.set_world_pose(np.array([0, 0, -1.0]), np.array([0, 0, 0, 1]))
+                # 安全处理垃圾对象
+                self._safely_remove_trash(trash)
                 self.collected_objects.append(task.target_name)
                 print(f"✅ {task.target_name} 收集成功!")
                 break
+    
+    def _safely_remove_trash(self, trash_object):
+        """安全移除垃圾对象 - 完全避免scene.remove_object"""
+        try:
+            print(f"   正在隐藏垃圾对象: {trash_object.name}")
+            
+            # 方法1: 禁用物理属性（但保留对象）
+            try:
+                trash_object.disable_rigid_body_physics()
+                print(f"   禁用物理属性: {trash_object.name}")
+            except Exception as e:
+                print(f"   物理禁用失败: {e}")
+            
+            # 方法2: 移动到地下远处
+            far_away_position = np.array([100.0, 100.0, -5.0])
+            trash_object.set_world_pose(far_away_position, np.array([0, 0, 0, 1]))
+            print(f"   移动到远处: {trash_object.name}")
+            
+            # 方法3: 设置为不可见
+            try:
+                trash_object.set_visibility(False)
+                print(f"   设置为不可见: {trash_object.name}")
+            except Exception as e:
+                print(f"   可见性设置失败: {e}")
+            
+            # 完全避免从场景中移除，这会破坏物理仿真
+            print(f"   垃圾对象处理完成: {trash_object.name}")
+            
+            # 等待物理更新
+            for _ in range(3):
+                self.world.step(render=False)
+                
+        except Exception as e:
+            print(f"   垃圾处理过程中出现错误: {e}")
+            # 备用简单处理
+            try:
+                far_away_position = np.array([100.0, 100.0, -5.0])
+                trash_object.set_world_pose(far_away_position, np.array([0, 0, 0, 1]))
+                print(f"   使用备用方法隐藏: {trash_object.name}")
+            except:
+                print(f"   无法处理垃圾对象: {trash_object.name}")
+    
+    def _post_task_calibration(self):
+        """任务完成后的位置校准"""
+        try:
+            print(f"   开始位置校准...")
+            
+            # 1. 完全停止机器人
+            for _ in range(15):
+                self.stabilized_controller.send_stable_command(0.0, 0.0)
+                self.world.step(render=False)
+            
+            # 2. 获取当前位置
+            current_pos, current_yaw = self.get_robot_pose()
+            print(f"   当前位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}], 朝向: {np.degrees(current_yaw):.1f}°")
+            
+            # 3. 重置控制器状态
+            if hasattr(self.stabilized_controller, 'stuck_counter'):
+                self.stabilized_controller.stuck_counter = 0
+            if hasattr(self.stabilized_controller, 'last_position'):
+                self.stabilized_controller.last_position = current_pos.copy()
+            
+            # 4. 清空控制历史
+            if hasattr(self.stabilized_controller, 'velocity_filter'):
+                self.stabilized_controller.velocity_filter.clear()
+            if hasattr(self.stabilized_controller, 'angular_filter'):
+                self.stabilized_controller.angular_filter.clear()
+            
+            # 5. 小幅调整确保系统响应 - 高速版
+            for _ in range(3):  # 减少次数但增加速度
+                self.stabilized_controller.send_stable_command(0.0, 1.5)  # 快速转动
+                self.world.step(render=False)
+            
+            for _ in range(3):
+                self.stabilized_controller.send_stable_command(0.0, -1.5)  # 反向快速转动
+                self.world.step(render=False)
+                
+            # 6. 最终停止
+            for _ in range(10):
+                self.stabilized_controller.send_stable_command(0.0, 0.0)
+                self.world.step(render=False)
+            
+            print(f"   位置校准完成")
+            
+        except Exception as e:
+            print(f"   位置校准过程中出现错误: {e}")
+            # 备用停止
+            for _ in range(10):
+                try:
+                    self.stabilized_controller.send_stable_command(0.0, 0.0)
+                    self.world.step(render=False)
+                except:
+                    break
     
     def _show_results(self):
         """显示结果"""
         total_items = len(self.small_trash_objects) + len(self.large_trash_objects)
         success_count = len(self.collected_objects)
-        success_rate = (success_count / total_items) * 100
+        success_rate = (success_count / total_items) * 100 if total_items > 0 else 0.0
         
         total_nodes = sum(len(path) for path in self.target_paths.values())
         
@@ -1094,14 +1286,14 @@ class LightweightRobotSystem:
         print(f"   总路径节点: {total_nodes}")
         print(f"   轻量级A*路径规划: ✅")
         print(f"   专用无物理虚影资产: ✅")
+        print(f"   稳定运动控制: ✅")
         print(f"   灰色透明虚影显示: ✅")
-        print(f"   流畅路径执行: ✅")
     
     def run_lightweight_demo(self):
         """运行轻量级演示"""
         print("\n" + "="*80)
-        print("🚀 轻量级虚影避障系统 - Isaac Sim 4.5")
-        print("🗺️ 轻量级A*路径规划 | 👻 专用无物理资产 | ⚡ 流畅执行")
+        print("🚀 轻量级虚影避障系统 - Isaac Sim 4.5 稳定版")
+        print("🗺️ 轻量级A*路径规划 | 👻 专用无物理资产 | 🎮 稳定运动控制")
         print("="*80)
         
         pos, yaw = self.get_robot_pose()
@@ -1113,13 +1305,22 @@ class LightweightRobotSystem:
         self._move_arm_to_pose("home")
         
         print("\n🎉 轻量级虚影避障系统演示完成!")
-        print("💡 专用无物理虚影资产，灰色透明显示，高效稳定")
+        print("💡 稳定运动控制，无路径线干扰，专用虚影资产")
     
     def cleanup(self):
         """清理资源"""
         print("🧹 清理系统资源...")
-        self.ghost_manager.cleanup_all()
-        self.world.stop()
+        try:
+            if self.ghost_manager is not None:
+                self.ghost_manager.cleanup_all()
+        except Exception as e:
+            print(f"   虚影清理错误: {e}")
+        
+        try:
+            if self.world is not None:
+                self.world.stop()
+        except Exception as e:
+            print(f"   世界停止错误: {e}")
 
 def main():
     """主函数"""
@@ -1127,26 +1328,49 @@ def main():
     
     system = LightweightRobotSystem()
     
-    # 初始化系统
-    system.initialize_system()
-    system.initialize_robot()
-    system.setup_post_load()
-    system.create_trash_environment()
-    
-    # 稳定系统
-    print("⚡ 系统稳定中...")
-    for _ in range(30):
-        system.world.step(render=False)
-        time.sleep(0.02)
-    
-    # 运行轻量级演示
-    system.run_lightweight_demo()
-    
-    # 保持运行
-    print("\n💡 轻量级系统运行中，按 Ctrl+C 退出")
-    while True:
-        system.world.step(render=True)
-        time.sleep(0.016)
+    try:
+        # 初始化系统
+        if not system.initialize_system():
+            print("❌ 系统初始化失败")
+            return
+            
+        if not system.initialize_robot():
+            print("❌ 机器人初始化失败") 
+            return
+            
+        if not system.setup_post_load():
+            print("❌ 后加载设置失败")
+            return
+            
+        system.create_trash_environment()
+        
+        # 稳定系统
+        print("⚡ 系统稳定中...")
+        for _ in range(50):  # 增加稳定时间
+            system.world.step(render=False)
+            time.sleep(0.01)  # 减少延迟
+        
+        # 运行轻量级演示
+        system.run_lightweight_demo()
+        
+        # 保持运行
+        print("\n💡 轻量级系统运行中，按 Ctrl+C 退出")
+        while True:
+            system.world.step(render=True)
+            time.sleep(0.016)
+            
+    except KeyboardInterrupt:
+        print("\n👋 用户中断，正在清理...")
+    except Exception as e:
+        print(f"\n❌ 系统错误: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # 安全清理
+        try:
+            system.cleanup()
+        except Exception as cleanup_error:
+            print(f"   清理过程错误: {cleanup_error}")
 
 if __name__ == "__main__":
     main()
