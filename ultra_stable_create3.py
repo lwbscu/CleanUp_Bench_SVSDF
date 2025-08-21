@@ -1,13 +1,58 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 4.5 轻量级虚影避障系统 - 稳定优化版
+Isaac Sim 4.5 轻量级虚影避障系统 - 简化虚影版
 - 改进机器人运动控制，解决卡顿问题
 - 优化轮子控制，实现稳定直线运动
 - 修复虚影位置同步问题
 - 移除有问题的路径线功能
 - 添加运动平滑和稳定性辅助措施
 - 修复垃圾对象移除问题，避免物理仿真破坏
+- 简化虚影处理，只设置位置朝向，避免资源浪费
+- 添加速度宏定义，优化资源管理
 """
+
+# 内存监控工具
+import psutil
+
+def print_memory_usage(stage_name: str = ""):
+    """打印内存使用情况"""
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        print(f"💾 {stage_name} 内存使用: {memory_mb:.1f} MB")
+    except:
+        pass
+
+# =============================================================================
+# 🎮 用户可调节参数 - 在此处修改速度设置
+# =============================================================================
+# 机器人移动速度设置
+MAX_LINEAR_VELOCITY = 0.20      # 最大线速度 (m/s) - 降低以获得更稳定运动
+MAX_ANGULAR_VELOCITY = 3.0      # 最大角速度 (rad/s) - 降低转弯速度
+
+# 转弯控制参数
+TURN_GAIN = 8.0                 # 转弯增益 - 降低以减缓转弯
+FORWARD_ANGLE_GAIN = 4.0        # 前进时角度修正增益 - 降低以减少抖动
+
+# 虚影显示参数
+GHOST_DISPLAY_STEPS = 45        # 虚影展示时间步数 - 减少以节省资源
+MAX_GHOSTS_PER_TARGET = 4       # 每个目标最大虚影数 - 减少以节省内存
+
+# 导航参数
+NAVIGATION_TOLERANCE = 0.12     # 导航到达容忍度 (m) - 稍微降低精度以提高效率
+MAX_NAVIGATION_TIME = 10.0      # 最大导航时间 (s) - 避免长时间卡住
+
+# 资源管理参数
+STABILIZE_STEPS = 30            # 系统稳定步数 - 减少初始化时间
+GHOST_LOAD_STEPS = 1            # 虚影加载等待步数 - 最小化等待时间
+
+# 🔧 使用说明:
+# - 如果机器人转弯太快: 降低 MAX_ANGULAR_VELOCITY 和 TURN_GAIN
+# - 如果机器人移动太慢: 提高 MAX_LINEAR_VELOCITY  
+# - 如果系统卡顿: 降低 MAX_GHOSTS_PER_TARGET 和 GHOST_DISPLAY_STEPS
+# - 如果导航不精确: 降低 NAVIGATION_TOLERANCE
+# =============================================================================
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({
@@ -192,8 +237,8 @@ class LightweightPathPlanner:
         
         return path
 
-class EfficientGhostManager:
-    """高效虚影管理器 - 移除路径线功能"""
+class SimplifiedGhostManager:
+    """简化虚影管理器 - 只设置位置朝向"""
     
     def __init__(self, world: World):
         self.world = world
@@ -201,35 +246,53 @@ class EfficientGhostManager:
         self.ghost_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm3.usd"   # 虚影专用
         self.ghost_container_path = "/World/GhostVisualization"
         self.active_ghosts = {}
-        self.max_ghosts_per_target = 6
-        print("👻 虚影管理器初始化 - 专用无物理资产")
+        self.max_ghosts_per_target = MAX_GHOSTS_PER_TARGET
+        print(f"👻 简化虚影管理器初始化 - 仅位置朝向设置 (最大{MAX_GHOSTS_PER_TARGET}个虚影)")
     
     def create_target_ghosts(self, target_index: int, path_nodes: List[PathNode]):
-        """创建目标虚影"""
-        print(f"🎭 为目标 #{target_index} 创建无物理虚影...")
+        """创建目标虚影 - 简化版 + 资源管理"""
+        print(f"🎭 为目标 #{target_index} 创建简化虚影...")
         
-        self._cleanup_previous_ghosts()
-        self._ensure_container_exists()
-        
-        selected_nodes = self._select_efficient_nodes(path_nodes)
-        
-        ghost_prims = []
-        for i, node in enumerate(selected_nodes):
-            ghost_prim = self._create_efficient_ghost(target_index, i, node)
-            if ghost_prim:
-                ghost_prims.append(ghost_prim)
+        try:
+            # 强制清理之前的资源
+            self._cleanup_previous_ghosts()
             
-            if i >= self.max_ghosts_per_target - 1:
-                break
-        
-        self.active_ghosts[target_index] = ghost_prims
-        # 移除路径线创建，避免物理错误
-        # self._create_simple_path_lines(target_index, path_nodes)
-        
-        print(f"   完成: {len(ghost_prims)} 个无物理虚影")
-        
-        for _ in range(5):
-            self.world.step(render=False)
+            # 强制垃圾回收
+            gc.collect()
+            
+            self._ensure_container_exists()
+            
+            selected_nodes = self._select_efficient_nodes(path_nodes)
+            
+            ghost_prims = []
+            for i, node in enumerate(selected_nodes):
+                try:
+                    print(f"   创建虚影 #{i}/{len(selected_nodes)}")
+                    ghost_prim = self._create_simple_ghost(target_index, i, node)
+                    if ghost_prim:
+                        ghost_prims.append(ghost_prim)
+                    
+                    # 每创建一个虚影就进行小步稳定
+                    self.world.step(render=False)
+                    
+                    if i >= self.max_ghosts_per_target - 1:
+                        break
+                        
+                except Exception as e:
+                    print(f"   虚影 #{i} 创建失败: {e}")
+                    continue
+            
+            self.active_ghosts[target_index] = ghost_prims
+            print(f"   完成: {len(ghost_prims)} 个简化虚影")
+            
+            # 最小化稳定步骤
+            for _ in range(2):
+                self.world.step(render=False)
+                
+        except Exception as e:
+            print(f"   虚影创建过程出错: {e}")
+            # 清理失败的虚影
+            self._cleanup_previous_ghosts()
     
     def _select_efficient_nodes(self, path_nodes: List[PathNode]) -> List[PathNode]:
         """高效选择虚影节点"""
@@ -247,8 +310,8 @@ class EfficientGhostManager:
         selected.append(path_nodes[-1])  # 终点
         return selected
     
-    def _create_efficient_ghost(self, target_index: int, ghost_index: int, node: PathNode):
-        """创建虚影"""
+    def _create_simple_ghost(self, target_index: int, ghost_index: int, node: PathNode):
+        """创建简化虚影 - 仅设置位置朝向"""
         ghost_path = f"{self.ghost_container_path}/Target_{target_index}_Ghost_{ghost_index}"
         stage = self.world.stage
         
@@ -262,151 +325,120 @@ class EfficientGhostManager:
             references = ghost_prim.GetReferences()
             references.AddReference(self.ghost_usd_path)
             
-            # 等待加载
-            for _ in range(3):
+            # 最小化等待加载时间
+            for _ in range(GHOST_LOAD_STEPS):
                 self.world.step(render=False)
             
-            # 设置位置和姿态
+            # 只设置位置和姿态
             self._set_ghost_transform_simple(ghost_prim, node.position, node.orientation)
+            
+            # 简化的机械臂姿态设置
             self._set_arm_pose_simple(ghost_prim, node.arm_config)
             
-            # 设置灰色透明外观
-            self._apply_gray_transparency(ghost_prim, ghost_index)
-            
+            print(f"   虚影 #{ghost_index} 创建完成")
             return ghost_prim
             
         except Exception as e:
-            print(f"   虚影 #{ghost_index} 创建失败")
+            print(f"   虚影 #{ghost_index} 创建失败: {e}")
             return None
     
     def _set_ghost_transform_simple(self, ghost_prim, position: np.ndarray, orientation: float):
         """简化变换设置"""
-        ghost_position = Gf.Vec3f(float(position[0]), float(position[1]), float(position[2]))
-        yaw_degrees = float(np.degrees(orientation))
-        
-        xform = UsdGeom.Xformable(ghost_prim)
-        xform.ClearXformOpOrder()
-        
-        translate_op = xform.AddTranslateOp()
-        translate_op.Set(ghost_position)
-        
-        if abs(yaw_degrees) > 1.0:  # 只有显著旋转才设置
-            rotate_op = xform.AddRotateZOp()
-            rotate_op.Set(yaw_degrees)
+        try:
+            ghost_position = Gf.Vec3f(float(position[0]), float(position[1]), float(position[2]))
+            yaw_degrees = float(np.degrees(orientation))
+            
+            xform = UsdGeom.Xformable(ghost_prim)
+            xform.ClearXformOpOrder()
+            
+            # 设置位置
+            translate_op = xform.AddTranslateOp()
+            translate_op.Set(ghost_position)
+            
+            # 只有显著旋转才设置朝向
+            if abs(yaw_degrees) > 1.0:
+                rotate_op = xform.AddRotateZOp()
+                rotate_op.Set(yaw_degrees)
+        except Exception as e:
+            print(f"   变换设置失败: {e}")
     
     def _set_arm_pose_simple(self, ghost_prim, arm_config: List[float]):
-        """简化机械臂姿态设置"""
+        """极简机械臂姿态设置 - 避免卡住"""
         if len(arm_config) < 7:
             return
         
-        # 只设置主要关节
-        main_joints = [
-            ("panda_joint1", arm_config[0], "Z"),
-            ("panda_joint2", arm_config[1], "Y"),
-            ("panda_joint3", arm_config[2], "Z"),
-            ("panda_joint4", arm_config[3], "Y"),
-            ("panda_joint7", arm_config[6], "Z")
-        ]
-        
-        for joint_name, angle, axis in main_joints:
-            joint_path = f"{ghost_prim.GetPath()}/ridgeback_franka/{joint_name}"
-            if self.world.stage.GetPrimAtPath(joint_path):
-                joint_prim = self.world.stage.GetPrimAtPath(joint_path)
-                xform = UsdGeom.Xformable(joint_prim)
-                
-                if axis == "Z":
-                    rot_op = xform.AddRotateZOp()
-                else:
-                    rot_op = xform.AddRotateYOp()
-                rot_op.Set(float(np.degrees(angle)))
-    
-    def _apply_gray_transparency(self, ghost_prim, ghost_index: int):
-        """应用灰色透明外观"""
-        # 灰色系颜色 - 从浅灰到深灰
-        gray_values = [0.7, 0.6, 0.5, 0.4, 0.3, 0.2]
-        gray_value = gray_values[ghost_index % len(gray_values)]
-        ghost_color = Gf.Vec3f(gray_value, gray_value, gray_value)
-        
-        # 透明度 - 从透明到半透明
-        opacity = 0.2 + 0.3 * (ghost_index / max(1, self.max_ghosts_per_target - 1))
-        
-        print(f"   设置虚影外观: 灰度={gray_value:.1f}, 透明度={opacity:.2f}")
-        
         try:
-            # 处理所有mesh组件
-            mesh_count = 0
-            for prim in Usd.PrimRange(ghost_prim):
-                if prim.IsA(UsdGeom.Mesh) and mesh_count < 50:
+            # 只设置最关键的1个关节，避免复杂计算
+            key_joints = [
+                ("panda_joint1", arm_config[0], "Z"),
+            ]
+            
+            for joint_name, angle, axis in key_joints:
+                joint_path = f"{ghost_prim.GetPath()}/ridgeback_franka/{joint_name}"
+                if self.world.stage.GetPrimAtPath(joint_path):
                     try:
-                        mesh = UsdGeom.Mesh(prim)
+                        joint_prim = self.world.stage.GetPrimAtPath(joint_path)
+                        xform = UsdGeom.Xformable(joint_prim)
                         
-                        # 设置显示颜色（灰色）
-                        display_color_attr = mesh.CreateDisplayColorAttr()
-                        display_color_attr.Set([ghost_color])
+                        if axis == "Z":
+                            rot_op = xform.AddRotateZOp()
+                        else:
+                            rot_op = xform.AddRotateYOp()
+                        rot_op.Set(float(np.degrees(angle)))
                         
-                        # 设置透明度
-                        display_opacity_attr = mesh.CreateDisplayOpacityAttr()
-                        display_opacity_attr.Set([opacity])
-                        
-                        # 设置为透明渲染模式
-                        prim.CreateAttribute("primvars:displayOpacity", Sdf.ValueTypeNames.FloatArray).Set([opacity])
-                        prim.CreateAttribute("primvars:displayColor", Sdf.ValueTypeNames.Color3fArray).Set([ghost_color])
-                        
-                        # 强制材质更新 - 清除原有材质绑定
-                        material_attrs = [
-                            "material:binding",
-                            "material:binding:collection",
-                            "material:binding:preview"
-                        ]
-                        
-                        for attr_name in material_attrs:
-                            if prim.HasAttribute(attr_name):
-                                prim.RemoveProperty(attr_name)
-                        
-                        # 确保mesh可见但透明
-                        visibility_attr = prim.CreateAttribute("visibility", Sdf.ValueTypeNames.Token)
-                        visibility_attr.Set("inherited")
-                        
-                        mesh_count += 1
-                        
-                    except Exception as e:
-                        continue
-            
-            print(f"   成功设置 {mesh_count} 个mesh为灰色透明")
-            
-            # 等待渲染更新
-            for _ in range(3):
-                self.world.step(render=False)
-                
+                        # 立即跳出，只设置第一个找到的关节
+                        break
+                    except Exception:
+                        continue  # 跳过失败的关节
         except Exception as e:
-            print(f"   虚影外观设置失败: {e}")
-            # 备用简化设置
-            try:
-                ghost_prim.CreateAttribute("primvars:displayColor", Sdf.ValueTypeNames.Color3fArray).Set([ghost_color])
-                ghost_prim.CreateAttribute("primvars:displayOpacity", Sdf.ValueTypeNames.FloatArray).Set([opacity])
-            except:
-                pass
+            print(f"   机械臂设置跳过: {e}")
+            pass  # 完全跳过机械臂设置
     
     def _cleanup_previous_ghosts(self):
-        """清理之前的虚影"""
-        stage = self.world.stage
+        """清理之前的虚影 - 增强版"""
+        print("🧹 清理之前的虚影...")
         
-        if stage.GetPrimAtPath(self.ghost_container_path):
-            stage.RemovePrim(self.ghost_container_path)
-            self.world.step(render=False)
-        
-        self.active_ghosts.clear()
-    
-    def clear_target_ghosts(self, target_index: int):
-        """清除目标虚影"""
-        if target_index in self.active_ghosts:
-            for ghost_prim in self.active_ghosts[target_index]:
-                stage = self.world.stage
-                if stage.GetPrimAtPath(ghost_prim.GetPath()):
-                    stage.RemovePrim(ghost_prim.GetPath())
-            del self.active_ghosts[target_index]
-        
-        self.world.step(render=False)
+        try:
+            stage = self.world.stage
+            
+            # 1. 先尝试清理所有已知虚影
+            if self.active_ghosts:
+                target_indices = list(self.active_ghosts.keys())
+                for target_index in target_indices:
+                    if target_index in self.active_ghosts:
+                        for ghost_prim in self.active_ghosts[target_index]:
+                            try:
+                                ghost_path = ghost_prim.GetPath()
+                                if stage.GetPrimAtPath(ghost_path):
+                                    prim = stage.GetPrimAtPath(ghost_path)
+                                    prim.SetActive(False)
+                                    stage.RemovePrim(ghost_path)
+                            except:
+                                continue
+                        del self.active_ghosts[target_index]
+            
+            # 2. 强制删除整个容器
+            if stage.GetPrimAtPath(self.ghost_container_path):
+                container_prim = stage.GetPrimAtPath(self.ghost_container_path)
+                container_prim.SetActive(False)
+                stage.RemovePrim(self.ghost_container_path)
+                
+                # 强制多步清理
+                for _ in range(5):
+                    self.world.step(render=False)
+            
+            # 3. 清空字典
+            self.active_ghosts.clear()
+            
+            # 4. 强制垃圾回收
+            gc.collect()
+            
+            print("   之前的虚影清理完成")
+            
+        except Exception as e:
+            print(f"   清理过程出错: {e}")
+            # 备用清理
+            self.active_ghosts.clear()
     
     def _ensure_container_exists(self):
         """确保容器存在"""
@@ -414,9 +446,109 @@ class EfficientGhostManager:
         if not stage.GetPrimAtPath(self.ghost_container_path):
             stage.DefinePrim(self.ghost_container_path, "Xform")
     
+    def clear_target_ghosts(self, target_index: int):
+        """清除目标虚影 - 彻底清理版"""
+        print(f"🧹 彻底清理目标 #{target_index} 虚影...")
+        
+        try:
+            if target_index in self.active_ghosts:
+                stage = self.world.stage
+                
+                # 1. 逐个删除虚影prim
+                for ghost_prim in self.active_ghosts[target_index]:
+                    try:
+                        ghost_path = ghost_prim.GetPath()
+                        if stage.GetPrimAtPath(ghost_path):
+                            # 强制设置为不可见
+                            prim = stage.GetPrimAtPath(ghost_path)
+                            prim.SetActive(False)
+                            
+                            # 删除prim
+                            stage.RemovePrim(ghost_path)
+                            print(f"   删除虚影: {ghost_path}")
+                            
+                            # 每删除一个就步进一次
+                            self.world.step(render=False)
+                    except Exception as e:
+                        print(f"   删除虚影失败: {e}")
+                        continue
+                
+                # 2. 从字典中移除
+                del self.active_ghosts[target_index]
+                
+            # 3. 强制多步清理，确保GPU内存释放
+            print(f"   强制清理GPU内存...")
+            for _ in range(5):
+                self.world.step(render=False)
+                
+            # 4. 强制垃圾回收
+            gc.collect()
+            
+            # 5. 如果没有更多虚影，清除整个容器
+            if not self.active_ghosts:
+                self._force_cleanup_container()
+                
+            print(f"   目标 #{target_index} 虚影清理完成")
+            
+        except Exception as e:
+            print(f"   虚影清理过程出错: {e}")
+            # 备用：强制清除整个容器
+            self._force_cleanup_container()
+    
+    def _force_cleanup_container(self):
+        """强制清理虚影容器"""
+        try:
+            stage = self.world.stage
+            
+            if stage.GetPrimAtPath(self.ghost_container_path):
+                print(f"   强制清理虚影容器...")
+                
+                # 设置容器为不活跃
+                container_prim = stage.GetPrimAtPath(self.ghost_container_path)
+                container_prim.SetActive(False)
+                
+                # 删除容器
+                stage.RemovePrim(self.ghost_container_path)
+                
+                # 强制多步清理
+                for _ in range(8):
+                    self.world.step(render=False)
+                
+                print(f"   虚影容器清理完成")
+            
+            # 清空字典
+            self.active_ghosts.clear()
+            
+            # 强制垃圾回收
+            gc.collect()
+            
+        except Exception as e:
+            print(f"   容器清理失败: {e}")
+    
     def cleanup_all(self):
-        """清理所有资源"""
-        self._cleanup_previous_ghosts()
+        """清理所有资源 - 增强版"""
+        print("🧹 清理所有虚影资源...")
+        
+        try:
+            # 1. 清理所有目标的虚影
+            target_indices = list(self.active_ghosts.keys())
+            for target_index in target_indices:
+                self.clear_target_ghosts(target_index)
+            
+            # 2. 强制清理容器
+            self._force_cleanup_container()
+            
+            # 3. 额外的清理步骤
+            for _ in range(10):
+                self.world.step(render=False)
+            
+            # 4. 强制垃圾回收
+            gc.collect()
+            
+            print("✅ 所有虚影资源清理完成")
+            
+        except Exception as e:
+            print(f"❌ 资源清理失败: {e}")
 
 class StabilizedRobotController:
     """稳定化机器人控制器 - 解决运动问题"""
@@ -425,9 +557,9 @@ class StabilizedRobotController:
         self.mobile_base = mobile_base
         self.differential_controller = differential_controller
         
-        # 改进的控制参数 - 大幅提高转弯速度
-        self.max_linear_velocity = 0.25  
-        self.max_angular_velocity = 5.0  # 提高约8倍：0.6 → 5.0
+        # 使用宏定义的控制参数
+        self.max_linear_velocity = MAX_LINEAR_VELOCITY  
+        self.max_angular_velocity = MAX_ANGULAR_VELOCITY
         
         # 运动平滑参数
         self.velocity_filter = deque(maxlen=5)
@@ -660,7 +792,7 @@ class LightweightRobotSystem:
     def _initialize_systems(self):
         """初始化系统组件"""
         self.path_planner = LightweightPathPlanner(world_size=8.0, resolution=0.15)
-        self.ghost_manager = EfficientGhostManager(self.world)
+        self.ghost_manager = SimplifiedGhostManager(self.world)  # 使用简化虚影管理器
         self._add_environment_obstacles()
     
     def _add_environment_obstacles(self):
@@ -721,8 +853,8 @@ class LightweightRobotSystem:
                 name="create3_controller",
                 wheel_radius=0.036,
                 wheel_base=0.235,
-                max_linear_speed=0.25,  
-                max_angular_speed=5.0  # 大幅提高角速度
+                max_linear_speed=MAX_LINEAR_VELOCITY,  
+                max_angular_speed=MAX_ANGULAR_VELOCITY
             )
             
             print("✅ 机器人初始化成功")
@@ -741,8 +873,8 @@ class LightweightRobotSystem:
         try:
             self.world.reset()
             
-            # 额外稳定步骤
-            for _ in range(50):  # 增加稳定步数
+            # 使用宏定义的稳定步数
+            for _ in range(STABILIZE_STEPS):
                 self.world.step(render=False)
             
             self.mobile_base = self.world.scene.get_object("create3_robot")
@@ -1020,26 +1152,30 @@ class LightweightRobotSystem:
             # 获取路径
             path_nodes = self.target_paths[target_index]
             
-            # 创建轻量级虚影
+            # 创建简化虚影
             self.ghost_manager.create_target_ghosts(target_index, path_nodes)
             
-            # 展示虚影1.5秒
-            print("👻 展示无物理虚影...")
-            for _ in range(90):
+            # 展示虚影（用户可调节时间）
+            print(f"👻 展示简化虚影 ({GHOST_DISPLAY_STEPS}步)...")
+            for _ in range(GHOST_DISPLAY_STEPS):
                 self.world.step(render=True)
             
             # 执行路径
             print(f"🏃 执行路径（{len(path_nodes)}个节点）...")
             self._execute_stable_path(path_nodes, task)
             
-            # 清除虚影
+            # 清除虚影 - 彻底清理
+            print(f"🧹 清理目标 #{target_index} 的所有资源...")
             self.ghost_manager.clear_target_ghosts(target_index)
             
-            # 稳定系统
-            for _ in range(8):
+            # 强制垃圾回收，避免内存累积
+            gc.collect()
+            
+            # 额外的内存清理步骤
+            for _ in range(5):
                 self.world.step(render=False)
             
-            print(f"✅ 目标 {target_index} 完成")
+            print(f"✅ 目标 {target_index} 及其资源完全清理")
         
         print("\n🎉 所有目标执行完成!")
         self._show_results()
@@ -1047,8 +1183,8 @@ class LightweightRobotSystem:
     def _execute_stable_path(self, path_nodes: List[PathNode], task: TaskInfo):
         """执行稳定路径 - 改进版"""
         for i, node in enumerate(path_nodes):
-            # 稳定导航到节点
-            success = self._navigate_to_node_stable(node, tolerance=0.15)
+            # 稳定导航到节点 - 使用宏定义的容忍度
+            success = self._navigate_to_node_stable(node, tolerance=NAVIGATION_TOLERANCE)
             
             if not success:
                 print(f"   节点 {i} 导航失败，尝试继续...")
@@ -1073,9 +1209,12 @@ class LightweightRobotSystem:
         
         return True
     
-    def _navigate_to_node_stable(self, node: PathNode, tolerance: float = 0.15) -> bool:
-        """稳定导航到节点 - 改进转弯控制"""
-        max_time = 12.0  # 增加最大时间
+    def _navigate_to_node_stable(self, node: PathNode, tolerance: float = None) -> bool:
+        """稳定导航到节点 - 使用可调节参数"""
+        if tolerance is None:
+            tolerance = NAVIGATION_TOLERANCE
+            
+        max_time = MAX_NAVIGATION_TIME
         start_time = time.time()
         
         print(f"   导航到节点: [{node.position[0]:.2f}, {node.position[1]:.2f}]")
@@ -1103,16 +1242,16 @@ class LightweightRobotSystem:
                 while angle_diff < -np.pi:
                     angle_diff += 2 * np.pi
                 
-                # 改进的控制策略 - 高速转弯
-                if abs(angle_diff) > 0.1:  # 降低转弯阈值
-                    # 纯转弯，大幅提高角速度
+                # 使用可调节的控制策略
+                if abs(angle_diff) > 0.1:  # 转弯阈值
+                    # 纯转弯，使用用户定义的转弯增益
                     linear_vel = 0.0
-                    angular_vel = np.clip(angle_diff * 15.0, -4.5, 4.5)  # 增益提高约7.5倍
-                    print(f"   高速转弯: 角度差={np.degrees(angle_diff):.1f}°, 角速度={angular_vel:.2f}")
+                    angular_vel = np.clip(angle_diff * TURN_GAIN, -MAX_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY)
+                    print(f"   转弯: 角度差={np.degrees(angle_diff):.1f}°, 角速度={angular_vel:.2f}")
                 else:
-                    # 前进，但保持一定的角度修正
-                    linear_vel = min(0.2, max(0.06, distance * 0.6))
-                    angular_vel = np.clip(angle_diff * 8.0, -2.0, 2.0)  # 前进时的角度修正也提高
+                    # 前进，使用用户定义的角度修正增益
+                    linear_vel = min(MAX_LINEAR_VELOCITY, max(0.06, distance * 0.6))
+                    angular_vel = np.clip(angle_diff * FORWARD_ANGLE_GAIN, -2.0, 2.0)
                     print(f"   前进: 距离={distance:.2f}m, 线速度={linear_vel:.2f}")
                 
                 # 发送稳定控制命令
@@ -1285,15 +1424,17 @@ class LightweightRobotSystem:
         print(f"   成功率: {success_rate:.1f}%")
         print(f"   总路径节点: {total_nodes}")
         print(f"   轻量级A*路径规划: ✅")
-        print(f"   专用无物理虚影资产: ✅")
+        print(f"   简化虚影资产: ✅")
         print(f"   稳定运动控制: ✅")
-        print(f"   灰色透明虚影显示: ✅")
+        print(f"   极简虚影处理: ✅")
+        print(f"   用户可调节参数: ✅")
+        print(f"   内存优化管理: ✅")
     
     def run_lightweight_demo(self):
         """运行轻量级演示"""
         print("\n" + "="*80)
-        print("🚀 轻量级虚影避障系统 - Isaac Sim 4.5 稳定版")
-        print("🗺️ 轻量级A*路径规划 | 👻 专用无物理资产 | 🎮 稳定运动控制")
+        print("🚀 轻量级虚影避障系统 - Isaac Sim 4.5 优化版")
+        print("🗺️ 轻量级A*路径规划 | 👻 极简虚影处理 | 🎮 可调节参数控制")
         print("="*80)
         
         pos, yaw = self.get_robot_pose()
@@ -1305,26 +1446,55 @@ class LightweightRobotSystem:
         self._move_arm_to_pose("home")
         
         print("\n🎉 轻量级虚影避障系统演示完成!")
-        print("💡 稳定运动控制，无路径线干扰，专用虚影资产")
+        print("💡 极简虚影处理，用户可调节参数，内存优化管理")
     
     def cleanup(self):
-        """清理资源"""
-        print("🧹 清理系统资源...")
-        try:
-            if self.ghost_manager is not None:
-                self.ghost_manager.cleanup_all()
-        except Exception as e:
-            print(f"   虚影清理错误: {e}")
+        """清理资源 - 彻底清理版"""
+        print("🧹 彻底清理系统资源...")
         
         try:
+            # 1. 清理虚影管理器
+            if self.ghost_manager is not None:
+                self.ghost_manager.cleanup_all()
+                
+            # 2. 强制垃圾回收
+            print("   强制垃圾回收...")
+            gc.collect()
+            
+            # 3. 额外的清理步骤
             if self.world is not None:
-                self.world.stop()
+                print("   清理物理世界...")
+                for _ in range(10):
+                    try:
+                        self.world.step(render=False)
+                    except:
+                        break
+                
+                # 4. 停止世界
+                try:
+                    self.world.stop()
+                    print("   世界停止完成")
+                except Exception as e:
+                    print(f"   世界停止错误: {e}")
+            
+            # 5. 最后的垃圾回收
+            gc.collect()
+            print("✅ 系统资源彻底清理完成")
+            
         except Exception as e:
-            print(f"   世界停止错误: {e}")
+            print(f"❌ 清理过程出错: {e}")
+            # 备用清理
+            try:
+                if self.world is not None:
+                    self.world.stop()
+            except:
+                pass
 
 def main():
     """主函数"""
     print("🚀 启动轻量级虚影避障系统...")
+    print(f"⚙️ 当前参数: 线速度={MAX_LINEAR_VELOCITY}m/s, 角速度={MAX_ANGULAR_VELOCITY}rad/s")
+    print(f"⚙️ 虚影设置: 每目标{MAX_GHOSTS_PER_TARGET}个, 展示{GHOST_DISPLAY_STEPS}步")
     
     system = LightweightRobotSystem()
     
@@ -1346,7 +1516,7 @@ def main():
         
         # 稳定系统
         print("⚡ 系统稳定中...")
-        for _ in range(50):  # 增加稳定时间
+        for _ in range(STABILIZE_STEPS):
             system.world.step(render=False)
             time.sleep(0.01)  # 减少延迟
         
