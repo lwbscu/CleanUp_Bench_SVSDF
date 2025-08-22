@@ -1,66 +1,59 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 4.5 最终版轻量级虚影避障系统
-- 采用最有效的清理策略：直接删除整个容器
-- 避免复杂的USD引用API，使用简单有效的方法
-- 每个目标完成后立即清理，防止内存累积
+Isaac Sim 4.5 动态路径显示系统
+- 内存充足时使用虚影显示路径
+- 达到阈值后切换到轻量级线条显示
+- 确保资源不会溢出
 """
 
 import psutil
 import torch
 
 def print_memory_usage(stage_name: str = ""):
-    try:
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / 1024 / 1024
-        print(f"💾 {stage_name} 内存: {memory_mb:.1f}MB")
-        return memory_mb
-    except Exception as e:
-        print(f"❌ 内存检查失败: {e}")
-        return 0
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    print(f"💾 {stage_name} 内存: {memory_mb:.1f}MB")
+    return memory_mb
 
 def print_stage_statistics(stage, stage_name: str = ""):
     """打印USD stage统计信息"""
-    try:
-        if stage is None:
-            print(f"📊 {stage_name} Stage: None")
-            return
-            
-        # 统计prim数量
-        total_prims = 0
-        ghost_prims = 0
-        robot_prims = 0
-        
-        for prim in stage.Traverse():
-            total_prims += 1
-            prim_path = str(prim.GetPath())
-            if "Ghost" in prim_path:
-                ghost_prims += 1
-            elif "create3" in prim_path or "robot" in prim_path:
-                robot_prims += 1
-        
-        print(f"📊 {stage_name} Stage统计: 总Prim={total_prims}, 虚影={ghost_prims}, 机器人={robot_prims}")
-            
-    except Exception as e:
-        print(f"❌ Stage统计失败: {e}")
+    total_prims = 0
+    ghost_prims = 0
+    robot_prims = 0
+    
+    for prim in stage.Traverse():
+        total_prims += 1
+        prim_path = str(prim.GetPath())
+        if "Ghost" in prim_path:
+            ghost_prims += 1
+        elif "create3" in prim_path or "robot" in prim_path:
+            robot_prims += 1
+    
+    print(f"📊 {stage_name} Stage统计: 总Prim={total_prims}, 虚影={ghost_prims}, 机器人={robot_prims}")
 
 # =============================================================================
 # 🎮 用户参数设置
 # =============================================================================
-MAX_LINEAR_VELOCITY = 0.18     
-MAX_ANGULAR_VELOCITY = 2.8     
-TURN_GAIN = 6.0                
-FORWARD_ANGLE_GAIN = 3.0       
+# 机器人运动控制参数
+MAX_LINEAR_VELOCITY = 0.18     # 机器人最大直线运动速度(m/s) - 控制前进后退的最大速度
+MAX_ANGULAR_VELOCITY = 2.8     # 机器人最大角速度(rad/s) - 控制转弯时的最大旋转速度
 
-GHOST_DISPLAY_STEPS = 35       
-GHOSTS_PER_TARGET = 5          
+# PID控制增益参数  
+TURN_GAIN = 6.0                # 转弯控制增益 - 纯转弯时角度误差的放大系数，值越大转弯越敏感
+FORWARD_ANGLE_GAIN = 3.0       # 前进时角度修正增益 - 直线行驶时的航向角修正系数
 
-NAVIGATION_TOLERANCE = 0.15    
-MAX_NAVIGATION_TIME = 8.0      
+# 路径可视化显示参数
+GHOST_DISPLAY_STEPS = 35       # 虚影路径展示步数 - 创建虚影后在屏幕上静态展示的仿真步数
+GHOSTS_PER_TARGET = 4          # 每个目标的默认虚影数量 - 实际会根据路径长度动态调整为3-5个
 
-STABILIZE_STEPS = 20           
-MEMORY_THRESHOLD_MB = 4000     
+# 导航控制参数
+NAVIGATION_TOLERANCE = 0.15    # 导航到达容差(m) - 机器人到目标点的距离小于此值时认为到达
+MAX_NAVIGATION_TIME = 8.0      # 单个导航点最大超时时间(s) - 避免机器人在某点卡死过久
+
+# 系统稳定性参数
+STABILIZE_STEPS = 20           # 系统稳定化步数 - 初始化后让物理引擎稳定运行的步数
+MEMORY_THRESHOLD_MB = 5500     # 内存阈值(MB) - 超过此内存使用量时自动从虚影显示切换到轻量级线条显示
 # =============================================================================
 
 from isaacsim import SimulationApp
@@ -234,137 +227,255 @@ class LightweightPathPlanner:
         
         return path
 
-class SimpleGhostManager:
-    """简化版虚影管理器 - 采用最有效的清理策略"""
+class DynamicPathVisualizer:
+    """动态路径可视化器 - 智能切换虚影和线条"""
     
     def __init__(self, world: World):
         self.world = world
-        # 资产路径
-        self.robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm2.usd"  # 实际机器人
-        self.ghost_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm3.usd"   # 虚影专用
+        self.current_strategy = "ghost"  # ghost 或 line
+        self.memory_threshold = MEMORY_THRESHOLD_MB
+        
+        # 虚影相关
+        self.robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm2.usd"
+        self.ghost_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm3.usd"
         self.ghost_container_path = "/World/GhostVisualization"
         
-        print(f"🚀 简化版虚影管理器初始化")
-        print(f"   实际机器人: create_3_with_arm2.usd")
-        print(f"   虚影机器人: create_3_with_arm3.usd")
-        print(f"   策略: 每目标完成后删除整个容器")
+        # 线条相关
+        self.line_container_path = "/World/PathLines"
+        self.line_prims = []
         
-        # 初始状态统计
-        print_stage_statistics(self.world.stage, "初始化")
-        print_memory_usage("虚影管理器初始化")
+        print(f"🎨 动态路径可视化器初始化")
+        print(f"   内存阈值: {self.memory_threshold}MB")
+        print(f"   初始策略: {self.current_strategy}")
     
-    def create_target_ghosts(self, target_index: int, path_nodes: List[PathNode]):
-        """创建目标虚影 - 简化版"""
-        print(f"🚀 [SIMPLE] 开始创建目标 #{target_index} 虚影...")
-        print_memory_usage(f"目标{target_index}创建前")
-        print_stage_statistics(self.world.stage, f"目标{target_index}创建前")
+    def check_memory_and_decide_strategy(self) -> str:
+        """检查内存并决定策略"""
+        current_memory = print_memory_usage("策略检查")
         
-        # 先清理（删除整个容器 - 最有效的方法）
-        print(f"🚀 [SIMPLE] 删除旧容器...")
-        self._delete_entire_container()
-        print_memory_usage(f"删除旧容器后")
-        print_stage_statistics(self.world.stage, f"删除旧容器后")
-        
-        # 重建容器
-        print(f"🚀 [SIMPLE] 重建虚影容器...")
-        self._create_container()
-        print_stage_statistics(self.world.stage, f"容器重建后")
-        
-        # 选择节点
-        selected_nodes = self._select_nodes(path_nodes, GHOSTS_PER_TARGET)
-        print(f"🚀 [SIMPLE] 选择了 {len(selected_nodes)} 个节点用于虚影创建")
-        
-        # 创建虚影
-        ghost_count = 0
-        for i, node in enumerate(selected_nodes):
-            print(f"🚀 [SIMPLE] 创建虚影 #{i+1}/{len(selected_nodes)}...")
-            memory_before = print_memory_usage(f"虚影{i}创建前")
-            
-            if self._create_ghost_simple(target_index, i, node):
-                ghost_count += 1
-            
-            memory_after = print_memory_usage(f"虚影{i}创建后")
-            memory_delta = memory_after - memory_before
-            print(f"🚀 [SIMPLE] 虚影{i} 内存增长: {memory_delta:.1f}MB")
-            
-            # 每创建一个就步进
-            self.world.step(render=False)
-        
-        print(f"🚀 [SIMPLE] 目标{target_index}虚影创建总结:")
-        print(f"   成功创建: {ghost_count} 个虚影")
-        
-        print_memory_usage(f"目标{target_index}创建完成")
-        print_stage_statistics(self.world.stage, f"目标{target_index}创建完成")
-    
-    def clear_target_ghosts(self, target_index: int):
-        """清除目标虚影 - 简化版：直接删除整个容器"""
-        print(f"🚀 [SIMPLE] 开始清除目标 #{target_index} 虚影...")
-        print_memory_usage(f"目标{target_index}清理前")
-        print_stage_statistics(self.world.stage, f"目标{target_index}清理前")
-        
-        # 最有效的清理方法：删除整个容器
-        print(f"🚀 [SIMPLE] 删除整个虚影容器...")
-        self._delete_entire_container()
-        
-        # 强制清理
-        print(f"🚀 [SIMPLE] 执行强制清理...")
-        for i in range(10):
-            self.world.step(render=False)
-            if i % 2 == 0:
-                gc.collect()
-        
-        # 清理GPU缓存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        print_memory_usage(f"目标{target_index}清理后")
-        print_stage_statistics(self.world.stage, f"目标{target_index}清理后")
-        print(f"🚀 [SIMPLE] 目标 #{target_index} 清理完成")
-    
-    def _delete_entire_container(self):
-        """删除整个容器 - 最有效的清理方法"""
-        stage = self.world.stage
-        
-        if stage.GetPrimAtPath(self.ghost_container_path):
-            try:
-                print(f"🚀 [SIMPLE]   找到容器，正在删除...")
-                
-                # 直接删除整个容器（这个方法是有效的）
-                stage.RemovePrim(self.ghost_container_path)
-                
-                # 强制步进确保删除生效
-                for _ in range(5):
-                    self.world.step(render=False)
-                
-                print(f"🚀 [SIMPLE]   容器删除成功")
-                
-            except Exception as e:
-                print(f"❌ [SIMPLE] 容器删除失败: {e}")
+        if current_memory > self.memory_threshold:
+            if self.current_strategy == "ghost":
+                print(f"🔄 内存超阈值({current_memory:.1f}MB > {self.memory_threshold}MB)，切换到线条显示")
+                self.current_strategy = "line"
+                self._clear_ghosts()
         else:
-            print(f"🚀 [SIMPLE]   容器不存在，无需删除")
-    
-    def _create_container(self):
-        """创建新容器"""
-        stage = self.world.stage
+            if self.current_strategy == "line":
+                print(f"🔄 内存充足({current_memory:.1f}MB < {self.memory_threshold}MB)，切换到虚影显示")
+                self.current_strategy = "ghost"
+                self._clear_lines()
         
-        # 确保路径干净
-        if stage.GetPrimAtPath(self.ghost_container_path):
-            stage.RemovePrim(self.ghost_container_path)
-            self.world.step(render=False)
+        return self.current_strategy
+    
+    def visualize_path(self, target_index: int, path_nodes: List[PathNode]):
+        """可视化路径 - 动态选择策略"""
+        strategy = self.check_memory_and_decide_strategy()
+        
+        print(f"🎨 目标{target_index} 使用策略: {strategy}")
+        
+        if strategy == "ghost":
+            self._create_ghost_visualization(target_index, path_nodes)
+        else:
+            self._create_line_visualization(target_index, path_nodes)
+    
+    def clear_current_visualization(self, target_index: int):
+        """清除当前可视化"""
+        if self.current_strategy == "ghost":
+            self._clear_ghosts()
+        else:
+            self._clear_lines()
+    
+    def _create_ghost_visualization(self, target_index: int, path_nodes: List[PathNode]):
+        """创建虚影可视化"""
+        print(f"👻 创建虚影可视化...")
+        
+        # 清理旧容器
+        self._delete_entire_container(self.ghost_container_path)
         
         # 创建新容器
+        stage = self.world.stage
         container_prim = stage.DefinePrim(self.ghost_container_path, "Xform")
-        print(f"🚀 [SIMPLE]   新容器已创建: {self.ghost_container_path}")
         
-        # 设置属性
-        xform = UsdGeom.Xformable(container_prim)
+        # 动态选择虚影数量（3-5个，根据路径长度）
+        ghost_count = self._calculate_dynamic_ghost_count(path_nodes)
+        selected_nodes = self._select_nodes(path_nodes, ghost_count)
+        
+        print(f"   路径长度: {len(path_nodes)}节点 → 虚影数量: {ghost_count}个")
+        
+        # 创建虚影
+        for i, node in enumerate(selected_nodes):
+            ghost_path = f"{self.ghost_container_path}/Target_{target_index}_Ghost_{i}"
+            self._create_single_ghost(ghost_path, node)
+            self.world.step(render=False)
+    
+    def _calculate_dynamic_ghost_count(self, path_nodes: List[PathNode]) -> int:
+        """根据路径长度动态计算虚影数量"""
+        path_length = len(path_nodes)
+        
+        if path_length <= 10:
+            return 3  # 短路径，3个虚影
+        elif path_length <= 15:
+            return 4  # 中等路径，4个虚影
+        else:
+            return 5  # 长路径，5个虚影
+    
+    def _create_line_visualization(self, target_index: int, path_nodes: List[PathNode]):
+        """创建线条可视化 - 2D贴地路径"""
+        print(f"📏 创建2D贴地路径线条...")
+        
+        # 清理旧线条
+        self._clear_lines()
+        
+        # 创建线条容器
+        stage = self.world.stage
+        if not stage.GetPrimAtPath(self.line_container_path):
+            container_prim = stage.DefinePrim(self.line_container_path, "Xform")
+        
+        # 创建路径线条
+        self._create_path_lines(target_index, path_nodes)
+        
+        # 创建关键点标记
+        self._create_waypoint_markers(target_index, path_nodes)
+    
+    def _create_path_lines(self, target_index: int, path_nodes: List[PathNode]):
+        """创建路径线条 - 2D贴地显示"""
+        if len(path_nodes) < 2:
+            return
+        
+        stage = self.world.stage
+        line_path = f"{self.line_container_path}/PathLine_{target_index}"
+        
+        # 创建线条几何
+        line_prim = stage.DefinePrim(line_path, "BasisCurves")
+        line_geom = UsdGeom.BasisCurves(line_prim)
+        
+        # 设置曲线属性
+        line_geom.CreateTypeAttr().Set("linear")
+        line_geom.CreateBasisAttr().Set("bspline")
+        
+        # 构建点列表 - 贴地面显示
+        points = []
+        curve_vertex_counts = []
+        
+        # 创建连续线段，贴近地面
+        for i in range(len(path_nodes) - 1):
+            start_pos = path_nodes[i].position
+            end_pos = path_nodes[i + 1].position
+            
+            # 非常贴近地面，只抬高0.02m避免z-fighting
+            start_pos_ground = Gf.Vec3f(float(start_pos[0]), float(start_pos[1]), 0.02)
+            end_pos_ground = Gf.Vec3f(float(end_pos[0]), float(end_pos[1]), 0.02)
+            
+            points.extend([start_pos_ground, end_pos_ground])
+            curve_vertex_counts.append(2)
+        
+        # 设置几何数据
+        line_geom.CreatePointsAttr().Set(points)
+        line_geom.CreateCurveVertexCountsAttr().Set(curve_vertex_counts)
+        
+        # 设置线条宽度 - 很细的线条
+        line_geom.CreateWidthsAttr().Set([0.05] * len(points))  # 0.5cm宽的细线
+
+        # 设置线条材质
+        self._setup_line_material(line_prim, target_index)
+        
+        self.line_prims.append(line_path)
+        print(f"   创建贴地路径线条: {len(points)//2}段")
+    
+    def _create_waypoint_markers(self, target_index: int, path_nodes: List[PathNode]):
+        """创建路径点标记 - 小巧贴地显示"""
+        stage = self.world.stage
+        selected_nodes = self._select_nodes(path_nodes, min(6, len(path_nodes)))
+        
+        for i, node in enumerate(selected_nodes):
+            marker_path = f"{self.line_container_path}/Waypoint_{target_index}_{i}"
+            
+            # 创建小球标记
+            marker_prim = stage.DefinePrim(marker_path, "Sphere")
+            sphere_geom = UsdGeom.Sphere(marker_prim)
+            
+            # 设置很小的半径 - 不遮挡视野
+            sphere_geom.CreateRadiusAttr().Set(0.1)  # 只有1cm半径
+
+            # 设置位置 - 贴近地面
+            marker_pos = Gf.Vec3d(float(node.position[0]), float(node.position[1]), 0.03)  # 只抬高3cm
+            xform = UsdGeom.Xformable(marker_prim)
+            translate_op = xform.AddTranslateOp()
+            translate_op.Set(marker_pos)
+            
+            # 设置颜色 - 更亮一些方便看到
+            if i == 0:
+                color = [0.2, 1.0, 0.2]  # 绿色起点
+            elif i == len(selected_nodes)-1:
+                color = [1.0, 0.2, 0.2]  # 红色终点
+            else:
+                color = [0.2, 0.6, 1.0]  # 蓝色中间点
+            
+            self._setup_marker_material(marker_prim, color)
+            
+            self.line_prims.append(marker_path)
+        
+        print(f"   创建贴地路径点标记: {len(selected_nodes)}个")
+    
+    def _setup_line_material(self, line_prim, target_index: int):
+        """设置线条材质 - 2D地面路径风格"""
+        # 创建材质
+        material_path = f"/World/Materials/LineMaterial_{target_index}"
+        stage = self.world.stage
+        
+        material_prim = stage.DefinePrim(material_path, "Material")
+        material = UsdShade.Material(material_prim)
+        
+        # 创建shader
+        shader_prim = stage.DefinePrim(f"{material_path}/Shader", "Shader")
+        shader = UsdShade.Shader(shader_prim)
+        shader.CreateIdAttr("UsdPreviewSurface")
+        
+        # 设置明亮的路径颜色 - 像地面导航线
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set((0.1, 0.8, 1.0))  # 明亮青色
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set((0.05, 0.4, 0.5))  # 轻微发光
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.8)  # 较高粗糙度，避免反光
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)  # 非金属
+        
+        # 连接输出
+        material_output = material.CreateSurfaceOutput()
+        shader_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+        material_output.ConnectToSource(shader_output)
+        
+        # 绑定材质
+        UsdShade.MaterialBindingAPI(line_prim).Bind(material)
+    
+    def _setup_marker_material(self, marker_prim, color: List[float]):
+        """设置标记材质"""
+        # 简化材质设置，直接使用displayColor
+        marker_geom = UsdGeom.Gprim(marker_prim)
+        marker_geom.CreateDisplayColorAttr().Set([color])
+    
+    def _create_single_ghost(self, ghost_path: str, node: PathNode):
+        """创建单个虚影"""
+        stage = self.world.stage
+        
+        # 创建虚影prim
+        ghost_prim = stage.DefinePrim(ghost_path, "Xform")
+        
+        # 添加引用
+        references = ghost_prim.GetReferences()
+        references.AddReference(self.ghost_usd_path)
+        
+        # 设置变换 - 使用正确的USD类型
+        ghost_position = Gf.Vec3d(float(node.position[0]), float(node.position[1]), float(node.position[2]))
+        yaw_degrees = float(np.degrees(node.orientation))
+        
+        xform = UsdGeom.Xformable(ghost_prim)
         xform.ClearXformOpOrder()
         
-        self.world.step(render=False)
-        print(f"🚀 [SIMPLE] 容器创建完成")
+        translate_op = xform.AddTranslateOp()
+        translate_op.Set(ghost_position)
+        
+        if abs(yaw_degrees) > 1.0:
+            rotate_op = xform.AddRotateZOp()
+            rotate_op.Set(yaw_degrees)
     
     def _select_nodes(self, path_nodes: List[PathNode], count: int) -> List[PathNode]:
-        """选择节点"""
+        """选择关键节点"""
         if len(path_nodes) <= count:
             return path_nodes
         
@@ -379,80 +490,47 @@ class SimpleGhostManager:
         selected.append(path_nodes[-1])  # 终点
         return selected
     
-    def _create_ghost_simple(self, target_index: int, ghost_index: int, node: PathNode):
-        """简化版创建单个虚影"""
-        ghost_path = f"{self.ghost_container_path}/Target_{target_index}_Ghost_{ghost_index}"
+    def _clear_ghosts(self):
+        """清除虚影"""
+        self._delete_entire_container(self.ghost_container_path)
+    
+    def _clear_lines(self):
+        """清除线条"""
         stage = self.world.stage
         
-        print(f"🚀 [SIMPLE]     创建虚影: {ghost_path}")
+        # 删除所有线条prims
+        for line_path in self.line_prims:
+            if stage.GetPrimAtPath(line_path):
+                stage.RemovePrim(line_path)
         
-        try:
-            # 确保路径干净
-            if stage.GetPrimAtPath(ghost_path):
-                print(f"🚀 [SIMPLE]       发现旧虚影，先删除...")
-                stage.RemovePrim(ghost_path)
-                self.world.step(render=False)
-            
-            # 创建虚影prim
-            print(f"🚀 [SIMPLE]       定义Prim...")
-            ghost_prim = stage.DefinePrim(ghost_path, "Xform")
-            
-            # 添加引用（简化版：不再试图清理引用，只创建）
-            print(f"🚀 [SIMPLE]       添加USD引用...")
-            references = ghost_prim.GetReferences()
-            references.AddReference(self.ghost_usd_path)
-            
-            # 等待加载
-            print(f"🚀 [SIMPLE]       等待USD加载...")
-            for i in range(3):
-                self.world.step(render=False)
-                # 检查是否加载成功
-                if ghost_prim.IsValid() and len(list(ghost_prim.GetChildren())) > 0:
-                    break
-            
-            # 检查加载状态
-            children_count = len(list(ghost_prim.GetChildren()))
-            print(f"🚀 [SIMPLE]       USD加载状态: 子对象={children_count}")
-            
-            # 设置变换
-            print(f"🚀 [SIMPLE]       设置变换...")
-            self._set_transform_simple(ghost_prim, node.position, node.orientation)
-            
-            print(f"🚀 [SIMPLE]     虚影 #{ghost_index+1} 创建成功")
-            return True
-            
-        except Exception as e:
-            print(f"❌ [SIMPLE]     虚影 #{ghost_index+1} 创建失败: {e}")
-            return False
+        self.line_prims.clear()
+        
+        # 删除线条容器
+        if stage.GetPrimAtPath(self.line_container_path):
+            stage.RemovePrim(self.line_container_path)
+        
+        # 删除材质
+        materials_path = "/World/Materials"
+        if stage.GetPrimAtPath(materials_path):
+            materials_prim = stage.GetPrimAtPath(materials_path)
+            for child in materials_prim.GetChildren():
+                if "LineMaterial" in str(child.GetPath()):
+                    stage.RemovePrim(child.GetPath())
     
-    def _set_transform_simple(self, ghost_prim, position: np.ndarray, orientation: float):
-        """简化版设置变换"""
-        try:
-            ghost_position = Gf.Vec3f(float(position[0]), float(position[1]), float(position[2]))
-            yaw_degrees = float(np.degrees(orientation))
-            
-            print(f"🚀 [SIMPLE]         位置: {ghost_position}, 朝向: {yaw_degrees:.1f}°")
-            
-            xform = UsdGeom.Xformable(ghost_prim)
-            xform.ClearXformOpOrder()
-            
-            translate_op = xform.AddTranslateOp()
-            translate_op.Set(ghost_position)
-            
-            if abs(yaw_degrees) > 1.0:
-                rotate_op = xform.AddRotateZOp()
-                rotate_op.Set(yaw_degrees)
-            
-            print(f"🚀 [SIMPLE]         变换设置成功")
-        except Exception as e:
-            print(f"❌ [SIMPLE]         变换设置失败: {e}")
+    def _delete_entire_container(self, container_path: str):
+        """删除整个容器"""
+        stage = self.world.stage
+        
+        if stage.GetPrimAtPath(container_path):
+            stage.RemovePrim(container_path)
+            for _ in range(5):
+                self.world.step(render=False)
     
     def cleanup_all(self):
         """清理所有资源"""
-        print("🚀 [SIMPLE] 最终清理所有虚影资源...")
-        print_memory_usage("最终清理前")
-        self._delete_entire_container()
-        print_memory_usage("最终清理后")
+        print("🧹 清理可视化资源...")
+        self._clear_ghosts()
+        self._clear_lines()
 
 class StabilizedRobotController:
     """稳定机器人控制器"""
@@ -487,36 +565,31 @@ class StabilizedRobotController:
     
     def _apply_wheel_control(self, linear_vel: float, angular_vel: float):
         """应用轮子控制"""
-        try:
-            articulation_controller = self.mobile_base.get_articulation_controller()
-            
-            wheel_radius = 0.036
-            wheel_base = 0.235
-            
-            left_wheel_vel = (linear_vel - angular_vel * wheel_base / 2.0) / wheel_radius
-            right_wheel_vel = (linear_vel + angular_vel * wheel_base / 2.0) / wheel_radius
-            
-            # 直线运动对称性
-            if abs(angular_vel) < 0.05:
-                avg_vel = (left_wheel_vel + right_wheel_vel) / 2.0
-                left_wheel_vel = avg_vel
-                right_wheel_vel = avg_vel
-            
-            num_dofs = len(self.mobile_base.dof_names)
-            joint_velocities = torch.zeros(num_dofs, dtype=torch.float32)
-            
-            left_wheel_idx = self.mobile_base.dof_names.index("left_wheel_joint")
-            right_wheel_idx = self.mobile_base.dof_names.index("right_wheel_joint")
-            
-            joint_velocities[left_wheel_idx] = float(left_wheel_vel)
-            joint_velocities[right_wheel_idx] = float(right_wheel_vel)
-            
-            action = ArticulationAction(joint_velocities=joint_velocities)
-            articulation_controller.apply_action(action)
-            
-        except Exception as e:
-            if "invalidated" not in str(e):
-                print(f"   控制错误: {e}")
+        articulation_controller = self.mobile_base.get_articulation_controller()
+        
+        wheel_radius = 0.036
+        wheel_base = 0.235
+        
+        left_wheel_vel = (linear_vel - angular_vel * wheel_base / 2.0) / wheel_radius
+        right_wheel_vel = (linear_vel + angular_vel * wheel_base / 2.0) / wheel_radius
+        
+        # 直线运动对称性
+        if abs(angular_vel) < 0.05:
+            avg_vel = (left_wheel_vel + right_wheel_vel) / 2.0
+            left_wheel_vel = avg_vel
+            right_wheel_vel = avg_vel
+        
+        num_dofs = len(self.mobile_base.dof_names)
+        joint_velocities = torch.zeros(num_dofs, dtype=torch.float32)
+        
+        left_wheel_idx = self.mobile_base.dof_names.index("left_wheel_joint")
+        right_wheel_idx = self.mobile_base.dof_names.index("right_wheel_joint")
+        
+        joint_velocities[left_wheel_idx] = float(left_wheel_vel)
+        joint_velocities[right_wheel_idx] = float(right_wheel_vel)
+        
+        action = ArticulationAction(joint_velocities=joint_velocities)
+        articulation_controller.apply_action(action)
     
     def check_movement_stability(self, current_position: np.ndarray) -> bool:
         """检查运动稳定性"""
@@ -565,7 +638,7 @@ class StabilizedRobotController:
             self.send_stable_command(0.0, 0.0)
 
 class OptimizedRobotSystem:
-    """优化版机器人系统"""
+    """优化版机器人系统 - 动态路径显示"""
     
     def __init__(self):
         self.world = None
@@ -582,7 +655,7 @@ class OptimizedRobotSystem:
         self.collected_objects = []
         
         self.path_planner = None
-        self.ghost_manager = None
+        self.path_visualizer = None  # 新的动态可视化器
         
         self.all_tasks = []
         self.target_paths = {}
@@ -599,7 +672,7 @@ class OptimizedRobotSystem:
     
     def initialize_system(self):
         """初始化系统"""
-        print("🚀 初始化最终版Isaac Sim 4.5环境...")
+        print("🚀 初始化动态路径显示系统...")
         
         self.world = World(
             stage_units_in_meters=1.0,
@@ -645,7 +718,7 @@ class OptimizedRobotSystem:
     def _initialize_systems(self):
         """初始化系统组件"""
         self.path_planner = LightweightPathPlanner(world_size=8.0, resolution=0.15)
-        self.ghost_manager = SimpleGhostManager(self.world)  # 使用简化版虚影管理器
+        self.path_visualizer = DynamicPathVisualizer(self.world)  # 使用动态可视化器
         self._add_environment_obstacles()
     
     def _add_environment_obstacles(self):
@@ -687,7 +760,6 @@ class OptimizedRobotSystem:
         """初始化机器人"""
         print("🤖 初始化Create-3+机械臂...")
         
-        # 使用实际机器人资产（有物理属性）
         robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm2.usd"
         
         self.mobile_base = WheeledRobot(
@@ -821,9 +893,9 @@ class OptimizedRobotSystem:
         """创建垃圾环境"""
         print("🗑️ 创建垃圾环境...")
         
-        # 只创建少量垃圾用于测试
+        # 创建少量垃圾用于测试
         small_trash_positions = [
-            [2.5, 0.0, 0.03], [2.0, 1.5, 0.03]  # 只创建2个小垃圾
+            [2.5, 0.0, 0.03], [2.0, 1.5, 0.03]
         ]
         
         for i, pos in enumerate(small_trash_positions):
@@ -837,7 +909,6 @@ class OptimizedRobotSystem:
             self.world.scene.add(trash)
             self.small_trash_objects.append(trash)
         
-        # 只创建1个大垃圾
         large_trash_positions = [
             [2.8, 1.0, 0.025]
         ]
@@ -933,7 +1004,7 @@ class OptimizedRobotSystem:
     
     def execute_mission(self):
         """执行任务"""
-        print("\n🚀 开始执行最终版任务...")
+        print("\n🚀 开始执行动态路径显示任务...")
         print_memory_usage("任务开始前")
         print_stage_statistics(self.world.stage, "任务开始前")
         
@@ -946,33 +1017,35 @@ class OptimizedRobotSystem:
             
             path_nodes = self.target_paths[target_index]
             
-            # 创建虚影（简化版）
-            print(f"🚀 [SIMPLE] ====== 目标{target_index}虚影创建开始 ======")
-            print_memory_usage(f"目标{target_index}虚影创建前")
-            self.ghost_manager.create_target_ghosts(target_index, path_nodes)
-            print_memory_usage(f"目标{target_index}虚影创建后")
-            print(f"🚀 [SIMPLE] ====== 目标{target_index}虚影创建完成 ======")
+            # 使用动态可视化器
+            print(f"🎨 ====== 目标{target_index}路径可视化开始 ======")
+            print_memory_usage(f"目标{target_index}可视化前")
+            self.path_visualizer.visualize_path(target_index, path_nodes)
+            print_memory_usage(f"目标{target_index}可视化后")
+            print(f"🎨 ====== 目标{target_index}路径可视化完成 ======")
             
-            # 展示虚影
-            print(f"👻 展示虚影 ({GHOST_DISPLAY_STEPS}步)...")
-            for step in range(GHOST_DISPLAY_STEPS):
+            # 展示路径
+            display_steps = GHOST_DISPLAY_STEPS if self.path_visualizer.current_strategy == "ghost" else 15
+            strategy_name = "虚影" if self.path_visualizer.current_strategy == "ghost" else "2D贴地线条"
+            print(f"👁️ 展示路径 ({display_steps}步, 策略:{strategy_name})...")
+            for step in range(display_steps):
                 self.world.step(render=True)
-                if step % 10 == 0:
-                    print(f"   展示进度: {step}/{GHOST_DISPLAY_STEPS}")
+                if step % 5 == 0:
+                    print(f"   展示进度: {step}/{display_steps}")
             
             # 执行路径
             print(f"🏃 执行路径（{len(path_nodes)}个节点）...")
             self._execute_path(path_nodes, task)
             
-            # 清除虚影（简化版：立即删除容器）
-            print(f"🚀 [SIMPLE] ====== 目标{target_index}虚影清理开始 ======")
+            # 清除可视化
+            print(f"🧹 ====== 目标{target_index}路径清理开始 ======")
             print_memory_usage(f"目标{target_index}清理前")
-            self.ghost_manager.clear_target_ghosts(target_index)
+            self.path_visualizer.clear_current_visualization(target_index)
             print_memory_usage(f"目标{target_index}清理后")
-            print(f"🚀 [SIMPLE] ====== 目标{target_index}虚影清理完成 ======")
+            print(f"🧹 ====== 目标{target_index}路径清理完成 ======")
             
             # 强制垃圾回收
-            print(f"🚀 [SIMPLE] 执行强制垃圾回收...")
+            print(f"🔄 执行强制垃圾回收...")
             for i in range(5):
                 gc.collect()
                 if torch.cuda.is_available():
@@ -981,9 +1054,7 @@ class OptimizedRobotSystem:
             
             print(f"✅ 目标 {target_index} 完成")
             print_stage_statistics(self.world.stage, f"目标{target_index}完成后")
-            
-            # 内存检查
-            current_memory = print_memory_usage(f"目标{target_index}最终内存")
+            print_memory_usage(f"目标{target_index}最终内存")
         
         print("\n🎉 所有目标执行完成!")
         print_memory_usage("所有任务完成后")
@@ -1170,22 +1241,24 @@ class OptimizedRobotSystem:
         
         total_nodes = sum(len(path) for path in self.target_paths.values())
         
-        print(f"\n📊 最终版任务执行结果:")
+        print(f"\n📊 动态路径显示任务执行结果:")
         print(f"   总目标数: {len(self.all_tasks)}")
         print(f"   总垃圾数: {total_items}")
         print(f"   成功收集: {success_count}")
         print(f"   成功率: {success_rate:.1f}%")
         print(f"   总路径节点: {total_nodes}")
-        print(f"   每目标虚影数: {GHOSTS_PER_TARGET}")
-        print(f"🚀 策略: 删除整个容器（最有效）")
-        print(f"✅ 内存泄漏问题彻底解决")
-        print(f"✅ 虚影正确清理")
+        print(f"   内存阈值: {MEMORY_THRESHOLD_MB}MB")
+        print(f"🎨 动态策略: 智能切换虚影/2D贴地线条")
+        print(f"👻 虚影数量: 3-5个（根据路径长度动态调整）")
+        print(f"📏 线条显示: 超薄贴地，不遮挡机器人视野")
+        print(f"✅ 资源占用得到有效控制")
+        print(f"✅ 避免内存溢出问题")
     
     def run_demo(self):
         """运行演示"""
         print("\n" + "="*80)
-        print("🚀 最终版轻量级虚影避障系统 - Isaac Sim 4.5")
-        print("🗺️ 简化清理策略 | 👻 删除整个容器 | 🎯 彻底解决内存泄漏")
+        print("🚀 动态路径显示系统 - Isaac Sim 4.5")
+        print("🎨 智能切换策略 | 👻 虚影 ⟷ 📏 2D贴地线条 | 🛡️ 防止资源溢出")
         print("="*80)
         
         pos, yaw = self.get_robot_pose()
@@ -1196,16 +1269,16 @@ class OptimizedRobotSystem:
         
         self._move_arm_to_pose("home")
         
-        print("\n🎉 最终版系统演示完成!")
-        print("💡 采用最有效的清理策略，彻底解决内存泄漏问题")
+        print("\n🎉 动态路径显示系统演示完成!")
+        print("💡 智能策略确保了资源的高效利用")
     
     def cleanup(self):
         """清理资源"""
         print("🧹 清理系统资源...")
         print_memory_usage("最终清理前")
         
-        if self.ghost_manager is not None:
-            self.ghost_manager.cleanup_all()
+        if self.path_visualizer is not None:
+            self.path_visualizer.cleanup_all()
             
         print("   强制垃圾回收...")
         for i in range(10):
@@ -1229,52 +1302,35 @@ class OptimizedRobotSystem:
 
 def main():
     """主函数"""
-    print("🚀 启动最终版轻量级虚影避障系统...")
+    print("🚀 启动动态路径显示系统...")
     print(f"⚙️ 运动参数: 线速度={MAX_LINEAR_VELOCITY}m/s, 角速度={MAX_ANGULAR_VELOCITY}rad/s")
-    print(f"⚙️ 虚影设置: 每目标{GHOSTS_PER_TARGET}个, 展示{GHOST_DISPLAY_STEPS}步")
+    print(f"⚙️ 显示设置: 虚影3-5个(根据路径长度), 2D贴地线条")
     print(f"⚙️ 内存管理: 阈值={MEMORY_THRESHOLD_MB}MB")
-    print(f"🚀 终极策略: 删除整个容器，避免复杂USD API")
+    print(f"🎨 智能策略: 动态切换虚影/2D贴地线条显示")
     
     system = OptimizedRobotSystem()
     
-    try:
-        if not system.initialize_system():
-            print("❌ 系统初始化失败")
-            return
-            
-        if not system.initialize_robot():
-            print("❌ 机器人初始化失败") 
-            return
-            
-        if not system.setup_post_load():
-            print("❌ 后加载设置失败")
-            return
-            
-        system.create_trash_environment()
-        
-        # 稳定系统
-        print("⚡ 系统稳定中...")
-        for _ in range(STABILIZE_STEPS):
-            system.world.step(render=False)
-            time.sleep(0.01)
-        
-        # 运行演示
-        system.run_demo()
-        
-        # 保持运行一段时间用于观察
-        print("\n💡 系统运行中，按 Ctrl+C 退出")
-        for i in range(100):  # 运行100步后自动退出
-            system.world.step(render=True)
-            time.sleep(0.1)
-            
-    except KeyboardInterrupt:
-        print("\n👋 用户中断，正在清理...")
-    except Exception as e:
-        print(f"\n❌ 系统错误: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        system.cleanup()
+    system.initialize_system()
+    system.initialize_robot()
+    system.setup_post_load()
+    system.create_trash_environment()
+    
+    # 稳定系统
+    print("⚡ 系统稳定中...")
+    for _ in range(STABILIZE_STEPS):
+        system.world.step(render=False)
+        time.sleep(0.01)
+    
+    # 运行演示
+    system.run_demo()
+    
+    # 保持运行一段时间用于观察
+    print("\n💡 系统运行中，按 Ctrl+C 退出")
+    for i in range(100):
+        system.world.step(render=True)
+        time.sleep(0.1)
+    
+    system.cleanup()
 
 if __name__ == "__main__":
     main()
