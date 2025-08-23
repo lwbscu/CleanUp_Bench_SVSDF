@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Isaac Sim 4.5 动态路径显示系统
-- 内存充足时使用虚影显示路径
-- 达到阈值后切换到轻量级线条显示
-- 确保资源不会溢出
+Isaac Sim 4.5 智能覆盖算法机器人系统 - 流畅可视化优化版
+- 覆盖算法进行区域地毯式移动
+- 智能结合物体抓取与清扫
+- 实时流畅的覆盖区域可视化标记系统
+- 动态路径显示
 """
 
 import psutil
@@ -36,24 +37,29 @@ def print_stage_statistics(stage, stage_name: str = ""):
 # 🎮 用户参数设置
 # =============================================================================
 # 机器人运动控制参数
-MAX_LINEAR_VELOCITY = 0.18     # 机器人最大直线运动速度(m/s) - 控制前进后退的最大速度
-MAX_ANGULAR_VELOCITY = 2.8     # 机器人最大角速度(rad/s) - 控制转弯时的最大旋转速度
+MAX_LINEAR_VELOCITY = 0.15     # 覆盖时的最大直线速度
+MAX_ANGULAR_VELOCITY = 2.5     # 覆盖时的最大角速度
 
-# PID控制增益参数  
-TURN_GAIN = 6.0                # 转弯控制增益 - 纯转弯时角度误差的放大系数，值越大转弯越敏感
-FORWARD_ANGLE_GAIN = 3.0       # 前进时角度修正增益 - 直线行驶时的航向角修正系数
+# 覆盖算法参数
+COVERAGE_CELL_SIZE = 0.8       # 覆盖网格大小(m) - 根据底盘直径(0.9m)设计，留小量重叠
+COVERAGE_AREA_SIZE = 6.0       # 覆盖区域大小(m)
+OVERLAP_DISTANCE = 5         # 覆盖重叠距离(m)
 
 # 路径可视化显示参数
-GHOST_DISPLAY_STEPS = 35       # 虚影路径展示步数 - 创建虚影后在屏幕上静态展示的仿真步数
-GHOSTS_PER_TARGET = 4          # 每个目标的默认虚影数量 - 实际会根据路径长度动态调整为3-5个
+GHOST_DISPLAY_STEPS = 25       # 虚影路径展示步数
+GHOSTS_PER_SEGMENT = 4         # 每个覆盖段的虚影数量
 
-# 导航控制参数
-NAVIGATION_TOLERANCE = 0.15    # 导航到达容差(m) - 机器人到目标点的距离小于此值时认为到达
-MAX_NAVIGATION_TIME = 8.0      # 单个导航点最大超时时间(s) - 避免机器人在某点卡死过久
+# 物体收集参数
+COLLECTION_DISTANCE = 0.45     # 物体收集距离(m) - 等于底盘半径
+COVERAGE_MARK_RADIUS = 0.45    # 覆盖标记半径(m) - 实际底盘半径
+
+# 流畅可视化参数
+FINE_GRID_SIZE = 0.1          # 精细网格大小(m) - 流畅可视化
+COVERAGE_UPDATE_FREQUENCY = 5  # 覆盖标记更新频率（每N步更新一次）
 
 # 系统稳定性参数
-STABILIZE_STEPS = 20           # 系统稳定化步数 - 初始化后让物理引擎稳定运行的步数
-MEMORY_THRESHOLD_MB = 5500     # 内存阈值(MB) - 超过此内存使用量时自动从虚影显示切换到轻量级线条显示
+STABILIZE_STEPS = 15           # 系统稳定化步数
+MEMORY_THRESHOLD_MB = 5500     # 内存阈值(MB)
 # =============================================================================
 
 from isaacsim import SimulationApp
@@ -71,9 +77,8 @@ import math
 import time
 import random
 from collections import deque
-import heapq
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 import gc
 
 from isaacsim.core.api import World
@@ -86,44 +91,177 @@ from pxr import UsdLux, UsdPhysics, Gf, UsdGeom, Usd, UsdShade, Sdf
 import isaacsim.core.utils.prims as prim_utils
 
 @dataclass
-class PathNode:
+class CoveragePoint:
     position: np.ndarray
     orientation: float
-    arm_config: List[float]
-    gripper_state: float
-    timestamp: float
-    node_id: int
-    action_type: str = "move"
-    target_index: int = -1
+    coverage_priority: float
+    has_object: bool = False
+    object_type: str = ""
+    node_id: int = 0
 
 @dataclass
-class TaskInfo:
-    target_name: str
-    target_position: np.ndarray
-    task_type: str
-    approach_pose: str
+class CoverageSegment:
+    points: List[CoveragePoint]
+    segment_type: str  # "main_line", "turn", "approach_object"
+    priority: float
 
-class LightweightPathPlanner:
-    """轻量级路径规划器"""
+class FluentCoverageVisualizer:
+    """流畅覆盖区域可视化器 - 实时跟随机器人移动"""
     
-    def __init__(self, world_size: float = 8.0, resolution: float = 0.15):
+    def __init__(self, world: World):
+        self.world = world
+        self.coverage_marks = {}  # 精细位置 -> 覆盖次数
+        self.mark_prims = {}      # 精细位置 -> prim路径
+        self.coverage_container = "/World/CoverageMarks"
+        self.last_marked_position = None
+        self.mark_counter = 0
+        
+        print("🎨 流畅覆盖可视化器初始化")
+    
+    def mark_coverage_realtime(self, robot_position: np.ndarray):
+        """实时标记覆盖区域 - 流畅跟随机器人移动"""
+        self.mark_counter += 1
+        
+        # 提高更新频率，每步都可能更新
+        if self.mark_counter % COVERAGE_UPDATE_FREQUENCY != 0:
+            return
+            
+        # 使用精细网格进行流畅标记
+        fine_grid_pos = self._fine_quantize_position(robot_position)
+        
+        # 检查是否需要新标记
+        if self._should_create_new_mark(fine_grid_pos):
+            self._create_fluent_coverage_mark(fine_grid_pos)
+            self.last_marked_position = fine_grid_pos.copy()
+    
+    def _should_create_new_mark(self, current_pos: np.ndarray) -> bool:
+        """判断是否应该创建新标记"""
+        if self.last_marked_position is None:
+            return True
+            
+        # 距离上次标记位置足够远时创建新标记
+        distance = np.linalg.norm(current_pos[:2] - self.last_marked_position[:2])
+        return distance >= FINE_GRID_SIZE
+    
+    def _fine_quantize_position(self, position: np.ndarray) -> np.ndarray:
+        """精细量化位置 - 更小的网格实现流畅效果"""
+        # 使用精细网格，确保标记连贯流畅
+        x = round(position[0] / FINE_GRID_SIZE) * FINE_GRID_SIZE
+        y = round(position[1] / FINE_GRID_SIZE) * FINE_GRID_SIZE
+        return np.array([x, y, 0.02])  # 略高于地面
+    
+    def _create_fluent_coverage_mark(self, position: np.ndarray):
+        """创建流畅的覆盖标记"""
+        stage = self.world.stage
+        
+        # 确保容器存在
+        if not stage.GetPrimAtPath(self.coverage_container):
+            stage.DefinePrim(self.coverage_container, "Xform")
+        
+        # 创建唯一的标记路径
+        mark_id = len(self.coverage_marks)
+        x_str = f"{position[0]:.2f}".replace(".", "p").replace("-", "N")
+        y_str = f"{position[1]:.2f}".replace(".", "p").replace("-", "N")
+        pos_key = f"{x_str}_{y_str}"
+        mark_path = f"{self.coverage_container}/FluentMark_{mark_id}_{pos_key}"
+        
+        # 记录覆盖
+        if pos_key in self.coverage_marks:
+            self.coverage_marks[pos_key] += 1
+            return  # 已存在标记，直接返回
+        else:
+            self.coverage_marks[pos_key] = 1
+        
+        coverage_count = self.coverage_marks[pos_key]
+        
+        # 创建圆形标记
+        mark_prim = stage.DefinePrim(mark_path, "Cylinder")
+        cylinder_geom = UsdGeom.Cylinder(mark_prim)
+        
+        # 设置为扁平圆盘，半径稍小于底盘半径实现更精细的标记
+        mark_radius = COVERAGE_MARK_RADIUS * 0.8  # 稍小一些，更精细
+        cylinder_geom.CreateRadiusAttr().Set(mark_radius)
+        cylinder_geom.CreateHeightAttr().Set(0.01)  # 更薄的圆盘
+        
+        # 设置位置 - 修复变换操作冲突
+        xform = UsdGeom.Xformable(mark_prim)
+        xform.ClearXformOpOrder()  # 清除现有变换操作
+        translate_op = xform.AddTranslateOp()
+        translate_op.Set(Gf.Vec3d(float(position[0]), float(position[1]), float(position[2])))
+        
+        # 禁用物理
+        UsdPhysics.RigidBodyAPI.Apply(mark_prim)
+        rigid_body = UsdPhysics.RigidBodyAPI(mark_prim)
+        rigid_body.CreateRigidBodyEnabledAttr().Set(False)
+        
+        # 设置流畅渐变颜色
+        self._set_fluent_color(mark_prim, coverage_count)
+        
+        # 记录标记
+        self.mark_prims[pos_key] = mark_path
+        
+        # 流畅进度显示
+        if len(self.coverage_marks) % 20 == 0:
+            print(f"🎨 流畅覆盖进度: {len(self.coverage_marks)}个精细标记")
+    
+    def _set_fluent_color(self, mark_prim, coverage_count: int):
+        """设置流畅渐变颜色"""
+        # 从亮绿色到深绿色的渐变，表示覆盖深度
+        intensity = min(coverage_count / 3.0, 1.0)  # 最多3次覆盖达到最深色
+        
+        # 绿色渐变：浅绿 -> 深绿
+        green_value = 0.8 - (intensity * 0.5)  # 0.8 -> 0.3
+        red_value = 0.2 + (intensity * 0.3)    # 0.2 -> 0.5  
+        blue_value = 0.2
+        
+        gprim = UsdGeom.Gprim(mark_prim)
+        gprim.CreateDisplayColorAttr().Set([(red_value, green_value, blue_value)])
+    
+    def cleanup(self):
+        """清理覆盖标记"""
+        stage = self.world.stage
+        
+        # 删除所有标记prims
+        for pos_key, mark_path in self.mark_prims.items():
+            if stage.GetPrimAtPath(mark_path):
+                stage.RemovePrim(mark_path)
+        
+        # 删除容器
+        if stage.GetPrimAtPath(self.coverage_container):
+            stage.RemovePrim(self.coverage_container)
+            
+        self.coverage_marks.clear()
+        self.mark_prims.clear()
+        self.last_marked_position = None
+        
+        print("🧹 流畅覆盖标记清理完成")
+
+class CoveragePathPlanner:
+    """智能覆盖路径规划器 - 适配0.45m底盘半径"""
+    
+    def __init__(self, world_size: float = COVERAGE_AREA_SIZE, cell_size: float = COVERAGE_CELL_SIZE):
         self.world_size = world_size
-        self.resolution = resolution
-        self.grid_size = int(world_size / resolution)
+        self.cell_size = cell_size
+        self.grid_size = int(world_size / cell_size)
         self.obstacles = []
         self.obstacle_grid = np.zeros((self.grid_size, self.grid_size), dtype=bool)
-        print(f"🗺️ 路径规划器: {self.grid_size}x{self.grid_size}网格")
+        self.objects_positions = []  # 待收集物体位置
+        
+        print(f"🗺️ 覆盖规划器: {self.grid_size}x{self.grid_size}网格, 单元格{cell_size}m")
+        print(f"   底盘半径: {COVERAGE_MARK_RADIUS}m, 覆盖直径: {COVERAGE_MARK_RADIUS*2}m")
     
     def add_obstacle(self, position: np.ndarray, size: np.ndarray, shape_type: str = 'box'):
-        """添加障碍物"""
+        """添加障碍物 - 考虑0.45m底盘半径"""
         self.obstacles.append({'pos': position, 'size': size, 'type': shape_type})
         
-        center_x = int((position[0] + self.world_size/2) / self.resolution)
-        center_y = int((position[1] + self.world_size/2) / self.resolution)
+        center_x = int((position[0] + self.world_size/2) / self.cell_size)
+        center_y = int((position[1] + self.world_size/2) / self.cell_size)
         
-        safety_margin = 0.6
+        # 安全距离 = 底盘半径 + 额外安全边距
+        safety_margin = COVERAGE_MARK_RADIUS + 0.2
+        
         if shape_type == 'sphere':
-            radius = int((size[0] + safety_margin) / self.resolution)
+            radius = int((size[0] + safety_margin) / self.cell_size)
             for dx in range(-radius, radius + 1):
                 for dy in range(-radius, radius + 1):
                     if dx*dx + dy*dy <= radius*radius:
@@ -131,108 +269,188 @@ class LightweightPathPlanner:
                         if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
                             self.obstacle_grid[x, y] = True
         else:
-            half_x = int((size[0]/2 + safety_margin) / self.resolution)
-            half_y = int((size[1]/2 + safety_margin) / self.resolution)
+            half_x = int((size[0]/2 + safety_margin) / self.cell_size)
+            half_y = int((size[1]/2 + safety_margin) / self.cell_size)
             for dx in range(-half_x, half_x + 1):
                 for dy in range(-half_y, half_y + 1):
                     x, y = center_x + dx, center_y + dy
                     if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
                         self.obstacle_grid[x, y] = True
     
-    def find_safe_path(self, start_pos: np.ndarray, goal_pos: np.ndarray) -> List[np.ndarray]:
-        """寻找安全路径"""
-        start_grid = self.world_to_grid(start_pos)
-        goal_grid = self.world_to_grid(goal_pos)
+    def add_objects(self, objects_list: List[np.ndarray]):
+        """添加待收集物体位置"""
+        self.objects_positions = objects_list
+        print(f"📦 添加 {len(objects_list)} 个待收集物体")
+    
+    def generate_coverage_path(self, start_pos: np.ndarray) -> List[CoverageSegment]:
+        """生成智能覆盖路径"""
+        print("🌀 生成覆盖路径...")
         
-        open_set = []
-        heapq.heappush(open_set, (0, start_grid))
-        came_from = {}
-        g_score = {start_grid: 0}
+        # 获取有效覆盖区域
+        valid_cells = self._get_valid_coverage_cells()
+        print(f"   有效覆盖单元格: {len(valid_cells)}")
         
-        directions = [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]
-        max_iterations = 800
-        iterations = 0
+        # 生成蛇形覆盖路径
+        coverage_segments = self._generate_serpentine_path(start_pos, valid_cells)
         
-        while open_set and iterations < max_iterations:
-            iterations += 1
-            current = heapq.heappop(open_set)[1]
+        # 优化路径，集成物体收集
+        optimized_segments = self._optimize_with_object_collection(coverage_segments)
+        
+        total_points = sum(len(seg.points) for seg in optimized_segments)
+        print(f"   生成覆盖段: {len(optimized_segments)}, 总点数: {total_points}")
+        
+        return optimized_segments
+    
+    def _get_valid_coverage_cells(self) -> List[Tuple[int, int]]:
+        """获取有效的覆盖单元格"""
+        valid_cells = []
+        
+        for x in range(self.grid_size):
+            for y in range(self.grid_size):
+                if not self.obstacle_grid[x, y]:
+                    # 检查是否在工作区域内
+                    world_x = (x * self.cell_size) - self.world_size/2
+                    world_y = (y * self.cell_size) - self.world_size/2
+                    
+                    if abs(world_x) < self.world_size/2 - 0.5 and abs(world_y) < self.world_size/2 - 0.5:
+                        valid_cells.append((x, y))
+        
+        return valid_cells
+    
+    def _generate_serpentine_path(self, start_pos: np.ndarray, valid_cells: List[Tuple[int, int]]) -> List[CoverageSegment]:
+        """生成蛇形覆盖路径"""
+        segments = []
+        
+        # 按Y坐标分组
+        rows = {}
+        for x, y in valid_cells:
+            if y not in rows:
+                rows[y] = []
+            rows[y].append(x)
+        
+        # 排序行
+        sorted_rows = sorted(rows.keys())
+        
+        # 生成蛇形路径
+        for i, row_y in enumerate(sorted_rows):
+            row_x_coords = sorted(rows[row_y])
             
-            if current == goal_grid:
-                path = []
-                while current in came_from:
-                    path.append(self.grid_to_world(*current))
-                    current = came_from[current]
-                path.append(self.grid_to_world(*start_grid))
-                path.reverse()
-                return self._smooth_path_simple(path)
+            # 奇数行反向
+            if i % 2 == 1:
+                row_x_coords.reverse()
             
-            for dx, dy in directions:
-                neighbor = (current[0] + dx, current[1] + dy)
+            # 创建该行的覆盖点
+            row_points = []
+            for x in row_x_coords:
+                world_pos = self._grid_to_world(x, row_y)
                 
-                if (0 <= neighbor[0] < self.grid_size and 
-                    0 <= neighbor[1] < self.grid_size and
-                    not self.obstacle_grid[neighbor[0], neighbor[1]]):
-                    
-                    move_cost = 1.4 if abs(dx) + abs(dy) == 2 else 1.0
-                    tentative_g = g_score[current] + move_cost
-                    
-                    if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                        came_from[neighbor] = current
-                        g_score[neighbor] = tentative_g
-                        f_score = tentative_g + self._heuristic(neighbor, goal_grid)
-                        heapq.heappush(open_set, (f_score, neighbor))
+                # 计算朝向
+                if len(row_points) > 0:
+                    direction = world_pos[:2] - row_points[-1].position[:2]
+                    orientation = np.arctan2(direction[1], direction[0])
+                else:
+                    orientation = 0.0 if i % 2 == 0 else np.pi
+                
+                coverage_point = CoveragePoint(
+                    position=world_pos,
+                    orientation=orientation,
+                    coverage_priority=1.0,
+                    node_id=len(row_points)
+                )
+                row_points.append(coverage_point)
+            
+            # 创建覆盖段
+            segment = CoverageSegment(
+                points=row_points,
+                segment_type="main_line",
+                priority=1.0
+            )
+            segments.append(segment)
+            
+            # 添加转弯段（除了最后一行）
+            if i < len(sorted_rows) - 1:
+                turn_segment = self._create_turn_segment(row_points[-1], sorted_rows[i+1])
+                segments.append(turn_segment)
         
-        return self._create_simple_path(start_pos, goal_pos)
+        return segments
     
-    def world_to_grid(self, world_pos: np.ndarray) -> Tuple[int, int]:
-        x = int((world_pos[0] + self.world_size/2) / self.resolution)
-        y = int((world_pos[1] + self.world_size/2) / self.resolution)
-        return np.clip(x, 0, self.grid_size-1), np.clip(y, 0, self.grid_size-1)
+    def _create_turn_segment(self, last_point: CoveragePoint, next_row_y: int) -> CoverageSegment:
+        """创建转弯段"""
+        # 简单的转弯：停留在当前位置调整朝向
+        turn_point = CoveragePoint(
+            position=last_point.position.copy(),
+            orientation=last_point.orientation + np.pi/2,  # 转90度
+            coverage_priority=0.5,
+            node_id=0
+        )
+        
+        return CoverageSegment(
+            points=[turn_point],
+            segment_type="turn",
+            priority=0.5
+        )
     
-    def grid_to_world(self, grid_x: int, grid_y: int) -> np.ndarray:
-        x = (grid_x * self.resolution) - self.world_size/2
-        y = (grid_y * self.resolution) - self.world_size/2
+    def _optimize_with_object_collection(self, segments: List[CoverageSegment]) -> List[CoverageSegment]:
+        """优化路径以集成物体收集"""
+        optimized_segments = []
+        
+        for segment in segments:
+            # 检查段内是否有物体需要收集
+            objects_in_segment = self._find_objects_near_segment(segment)
+            
+            if objects_in_segment:
+                # 在段内添加物体收集点
+                enhanced_segment = self._enhance_segment_with_objects(segment, objects_in_segment)
+                optimized_segments.append(enhanced_segment)
+            else:
+                optimized_segments.append(segment)
+        
+        return optimized_segments
+    
+    def _find_objects_near_segment(self, segment: CoverageSegment) -> List[np.ndarray]:
+        """查找段附近的物体 - 基于底盘半径"""
+        nearby_objects = []
+        
+        for obj_pos in self.objects_positions:
+            for point in segment.points:
+                distance = np.linalg.norm(point.position[:2] - obj_pos[:2])
+                if distance < COVERAGE_MARK_RADIUS * 1.5:  # 扩大检测范围到底盘半径的1.5倍
+                    nearby_objects.append(obj_pos)
+                    break
+        
+        return nearby_objects
+    
+    def _enhance_segment_with_objects(self, segment: CoverageSegment, objects: List[np.ndarray]) -> CoverageSegment:
+        """在段中增强物体收集 - 基于底盘半径"""
+        enhanced_points = []
+        
+        for point in segment.points:
+            enhanced_points.append(point)
+            
+            # 检查附近是否有物体 - 使用底盘半径作为收集距离
+            for obj_pos in objects:
+                distance = np.linalg.norm(point.position[:2] - obj_pos[:2])
+                if distance < COVERAGE_MARK_RADIUS:  # 使用底盘半径作为收集距离
+                    # 标记该点有物体
+                    point.has_object = True
+                    point.object_type = "collectible"
+                    point.coverage_priority = 2.0  # 提高优先级
+        
+        segment.points = enhanced_points
+        return segment
+    
+    def _grid_to_world(self, grid_x: int, grid_y: int) -> np.ndarray:
+        """网格坐标转世界坐标"""
+        x = (grid_x * self.cell_size) - self.world_size/2
+        y = (grid_y * self.cell_size) - self.world_size/2
         return np.array([x, y, 0.0])
-    
-    def _heuristic(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> float:
-        return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
-    
-    def _smooth_path_simple(self, path: List[np.ndarray]) -> List[np.ndarray]:
-        if len(path) <= 3:
-            return path
-        
-        smoothed = [path[0]]
-        i = 0
-        while i < len(path) - 1:
-            j = min(i + 3, len(path) - 1)
-            smoothed.append(path[j])
-            i = j
-        
-        return smoothed
-    
-    def _create_simple_path(self, start: np.ndarray, goal: np.ndarray) -> List[np.ndarray]:
-        direction = goal - start
-        distance = np.linalg.norm(direction[:2])
-        
-        if distance < 0.1:
-            return [start, goal]
-        
-        num_points = max(3, min(8, int(distance / 0.3)))
-        path = []
-        
-        for i in range(num_points + 1):
-            t = i / num_points
-            point = start + t * direction
-            path.append(point)
-        
-        return path
 
 class DynamicPathVisualizer:
-    """动态路径可视化器 - 智能切换虚影和线条"""
+    """动态路径可视化器 - 适配覆盖算法"""
     
     def __init__(self, world: World):
         self.world = world
-        self.current_strategy = "ghost"  # ghost 或 line
+        self.current_strategy = "ghost"
         self.memory_threshold = MEMORY_THRESHOLD_MB
         
         # 虚影相关
@@ -244,9 +462,7 @@ class DynamicPathVisualizer:
         self.line_container_path = "/World/PathLines"
         self.line_prims = []
         
-        print(f"🎨 动态路径可视化器初始化")
-        print(f"   内存阈值: {self.memory_threshold}MB")
-        print(f"   初始策略: {self.current_strategy}")
+        print(f"🎨 动态路径可视化器初始化（覆盖模式）")
     
     def check_memory_and_decide_strategy(self) -> str:
         """检查内存并决定策略"""
@@ -254,72 +470,53 @@ class DynamicPathVisualizer:
         
         if current_memory > self.memory_threshold:
             if self.current_strategy == "ghost":
-                print(f"🔄 内存超阈值({current_memory:.1f}MB > {self.memory_threshold}MB)，切换到线条显示")
+                print(f"🔄 内存超阈值，切换到线条显示")
                 self.current_strategy = "line"
                 self._clear_ghosts()
         else:
             if self.current_strategy == "line":
-                print(f"🔄 内存充足({current_memory:.1f}MB < {self.memory_threshold}MB)，切换到虚影显示")
+                print(f"🔄 内存充足，切换到虚影显示")
                 self.current_strategy = "ghost"
                 self._clear_lines()
         
         return self.current_strategy
     
-    def visualize_path(self, target_index: int, path_nodes: List[PathNode]):
-        """可视化路径 - 动态选择策略"""
+    def visualize_coverage_segment(self, segment_index: int, segment: CoverageSegment):
+        """可视化覆盖段"""
         strategy = self.check_memory_and_decide_strategy()
         
-        print(f"🎨 目标{target_index} 使用策略: {strategy}")
+        print(f"🎨 段{segment_index} 使用策略: {strategy}")
         
         if strategy == "ghost":
-            self._create_ghost_visualization(target_index, path_nodes)
+            self._create_ghost_visualization_for_segment(segment_index, segment)
         else:
-            self._create_line_visualization(target_index, path_nodes)
+            self._create_line_visualization_for_segment(segment_index, segment)
     
-    def clear_current_visualization(self, target_index: int):
-        """清除当前可视化"""
-        if self.current_strategy == "ghost":
-            self._clear_ghosts()
-        else:
-            self._clear_lines()
-    
-    def _create_ghost_visualization(self, target_index: int, path_nodes: List[PathNode]):
-        """创建虚影可视化"""
-        print(f"👻 创建虚影可视化...")
+    def _create_ghost_visualization_for_segment(self, segment_index: int, segment: CoverageSegment):
+        """为覆盖段创建虚影可视化"""
+        print(f"👻 创建段{segment_index}虚影...")
         
         # 清理旧容器
         self._delete_entire_container(self.ghost_container_path)
         
         # 创建新容器
         stage = self.world.stage
-        container_prim = stage.DefinePrim(self.ghost_container_path, "Xform")
+        stage.DefinePrim(self.ghost_container_path, "Xform")
         
-        # 动态选择虚影数量（3-5个，根据路径长度）
-        ghost_count = self._calculate_dynamic_ghost_count(path_nodes)
-        selected_nodes = self._select_nodes(path_nodes, ghost_count)
+        # 选择关键点创建虚影
+        selected_points = self._select_key_points(segment.points, GHOSTS_PER_SEGMENT)
         
-        print(f"   路径长度: {len(path_nodes)}节点 → 虚影数量: {ghost_count}个")
+        print(f"   段长度: {len(segment.points)}点 → 虚影数量: {len(selected_points)}个")
         
         # 创建虚影
-        for i, node in enumerate(selected_nodes):
-            ghost_path = f"{self.ghost_container_path}/Target_{target_index}_Ghost_{i}"
-            self._create_single_ghost(ghost_path, node)
+        for i, point in enumerate(selected_points):
+            ghost_path = f"{self.ghost_container_path}/Segment_{segment_index}_Ghost_{i}"
+            self._create_single_ghost(ghost_path, point)
             self.world.step(render=False)
     
-    def _calculate_dynamic_ghost_count(self, path_nodes: List[PathNode]) -> int:
-        """根据路径长度动态计算虚影数量"""
-        path_length = len(path_nodes)
-        
-        if path_length <= 10:
-            return 3  # 短路径，3个虚影
-        elif path_length <= 15:
-            return 4  # 中等路径，4个虚影
-        else:
-            return 5  # 长路径，5个虚影
-    
-    def _create_line_visualization(self, target_index: int, path_nodes: List[PathNode]):
-        """创建线条可视化 - 2D贴地路径"""
-        print(f"📏 创建2D贴地路径线条...")
+    def _create_line_visualization_for_segment(self, segment_index: int, segment: CoverageSegment):
+        """为覆盖段创建线条可视化"""
+        print(f"📏 创建段{segment_index}线条...")
         
         # 清理旧线条
         self._clear_lines()
@@ -327,129 +524,97 @@ class DynamicPathVisualizer:
         # 创建线条容器
         stage = self.world.stage
         if not stage.GetPrimAtPath(self.line_container_path):
-            container_prim = stage.DefinePrim(self.line_container_path, "Xform")
+            stage.DefinePrim(self.line_container_path, "Xform")
         
-        # 创建路径线条
-        self._create_path_lines(target_index, path_nodes)
+        # 创建覆盖路径线条
+        self._create_coverage_path_lines(segment_index, segment)
         
-        # 创建关键点标记
-        self._create_waypoint_markers(target_index, path_nodes)
+        # 创建物体标记
+        self._create_object_markers(segment_index, segment)
     
-    def _create_path_lines(self, target_index: int, path_nodes: List[PathNode]):
-        """创建路径线条 - 2D贴地显示"""
-        if len(path_nodes) < 2:
+    def _create_coverage_path_lines(self, segment_index: int, segment: CoverageSegment):
+        """创建覆盖路径线条"""
+        if len(segment.points) < 2:
             return
         
         stage = self.world.stage
-        line_path = f"{self.line_container_path}/PathLine_{target_index}"
+        line_path = f"{self.line_container_path}/CoverageLine_{segment_index}"
         
         # 创建线条几何
         line_prim = stage.DefinePrim(line_path, "BasisCurves")
         line_geom = UsdGeom.BasisCurves(line_prim)
         
-        # 设置曲线属性
         line_geom.CreateTypeAttr().Set("linear")
         line_geom.CreateBasisAttr().Set("bspline")
         
-        # 构建点列表 - 贴地面显示
+        # 构建覆盖路径点
         points = []
-        curve_vertex_counts = []
-        
-        # 创建连续线段，贴近地面
-        for i in range(len(path_nodes) - 1):
-            start_pos = path_nodes[i].position
-            end_pos = path_nodes[i + 1].position
-            
-            # 非常贴近地面，只抬高0.02m避免z-fighting
-            start_pos_ground = Gf.Vec3f(float(start_pos[0]), float(start_pos[1]), 0.02)
-            end_pos_ground = Gf.Vec3f(float(end_pos[0]), float(end_pos[1]), 0.02)
-            
-            points.extend([start_pos_ground, end_pos_ground])
-            curve_vertex_counts.append(2)
+        for point in segment.points:
+            pos_ground = Gf.Vec3f(float(point.position[0]), float(point.position[1]), 0.02)
+            points.append(pos_ground)
         
         # 设置几何数据
         line_geom.CreatePointsAttr().Set(points)
-        line_geom.CreateCurveVertexCountsAttr().Set(curve_vertex_counts)
+        line_geom.CreateCurveVertexCountsAttr().Set([len(points)])
+        line_geom.CreateWidthsAttr().Set([0.03] * len(points))  # 细线条
         
-        # 设置线条宽度 - 很细的线条
-        line_geom.CreateWidthsAttr().Set([0.05] * len(points))  # 0.5cm宽的细线
-
-        # 设置线条材质
-        self._setup_line_material(line_prim, target_index)
+        # 设置覆盖路径颜色
+        color = [0.2, 1.0, 0.2] if segment.segment_type == "main_line" else [1.0, 0.8, 0.2]
+        self._setup_line_material(line_prim, segment_index, color)
         
         self.line_prims.append(line_path)
-        print(f"   创建贴地路径线条: {len(points)//2}段")
+        print(f"   创建覆盖路径线条: {len(points)}点")
     
-    def _create_waypoint_markers(self, target_index: int, path_nodes: List[PathNode]):
-        """创建路径点标记 - 小巧贴地显示"""
-        stage = self.world.stage
-        selected_nodes = self._select_nodes(path_nodes, min(6, len(path_nodes)))
-        
-        for i, node in enumerate(selected_nodes):
-            marker_path = f"{self.line_container_path}/Waypoint_{target_index}_{i}"
-            
-            # 创建小球标记
-            marker_prim = stage.DefinePrim(marker_path, "Sphere")
-            sphere_geom = UsdGeom.Sphere(marker_prim)
-            
-            # 设置很小的半径 - 不遮挡视野
-            sphere_geom.CreateRadiusAttr().Set(0.1)  # 只有1cm半径
-
-            # 设置位置 - 贴近地面
-            marker_pos = Gf.Vec3d(float(node.position[0]), float(node.position[1]), 0.03)  # 只抬高3cm
-            xform = UsdGeom.Xformable(marker_prim)
-            translate_op = xform.AddTranslateOp()
-            translate_op.Set(marker_pos)
-            
-            # 设置颜色 - 更亮一些方便看到
-            if i == 0:
-                color = [0.2, 1.0, 0.2]  # 绿色起点
-            elif i == len(selected_nodes)-1:
-                color = [1.0, 0.2, 0.2]  # 红色终点
-            else:
-                color = [0.2, 0.6, 1.0]  # 蓝色中间点
-            
-            self._setup_marker_material(marker_prim, color)
-            
-            self.line_prims.append(marker_path)
-        
-        print(f"   创建贴地路径点标记: {len(selected_nodes)}个")
-    
-    def _setup_line_material(self, line_prim, target_index: int):
-        """设置线条材质 - 2D地面路径风格"""
-        # 创建材质
-        material_path = f"/World/Materials/LineMaterial_{target_index}"
+    def _create_object_markers(self, segment_index: int, segment: CoverageSegment):
+        """创建物体标记"""
         stage = self.world.stage
         
-        material_prim = stage.DefinePrim(material_path, "Material")
-        material = UsdShade.Material(material_prim)
-        
-        # 创建shader
-        shader_prim = stage.DefinePrim(f"{material_path}/Shader", "Shader")
-        shader = UsdShade.Shader(shader_prim)
-        shader.CreateIdAttr("UsdPreviewSurface")
-        
-        # 设置明亮的路径颜色 - 像地面导航线
-        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set((0.1, 0.8, 1.0))  # 明亮青色
-        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set((0.05, 0.4, 0.5))  # 轻微发光
-        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.8)  # 较高粗糙度，避免反光
-        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)  # 非金属
-        
-        # 连接输出
-        material_output = material.CreateSurfaceOutput()
-        shader_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
-        material_output.ConnectToSource(shader_output)
-        
-        # 绑定材质
-        UsdShade.MaterialBindingAPI(line_prim).Bind(material)
+        for i, point in enumerate(segment.points):
+            if point.has_object:
+                marker_path = f"{self.line_container_path}/ObjectMarker_{segment_index}_{i}"
+                
+                # 创建物体标记
+                marker_prim = stage.DefinePrim(marker_path, "Sphere")
+                sphere_geom = UsdGeom.Sphere(marker_prim)
+                sphere_geom.CreateRadiusAttr().Set(0.08)
+                
+                # 设置位置
+                marker_pos = Gf.Vec3d(float(point.position[0]), float(point.position[1]), 0.05)
+                xform = UsdGeom.Xformable(marker_prim)
+                translate_op = xform.AddTranslateOp()
+                translate_op.Set(marker_pos)
+                
+                # 设置亮红色表示有物体
+                gprim = UsdGeom.Gprim(marker_prim)
+                gprim.CreateDisplayColorAttr().Set([[1.0, 0.3, 0.3]])
+                
+                self.line_prims.append(marker_path)
     
-    def _setup_marker_material(self, marker_prim, color: List[float]):
-        """设置标记材质"""
-        # 简化材质设置，直接使用displayColor
-        marker_geom = UsdGeom.Gprim(marker_prim)
-        marker_geom.CreateDisplayColorAttr().Set([color])
+    def _select_key_points(self, points: List[CoveragePoint], count: int) -> List[CoveragePoint]:
+        """选择关键覆盖点"""
+        if len(points) <= count:
+            return points
+        
+        # 优先选择有物体的点
+        object_points = [p for p in points if p.has_object]
+        regular_points = [p for p in points if not p.has_object]
+        
+        selected = []
+        
+        # 先添加物体点
+        selected.extend(object_points[:count//2])
+        
+        # 再均匀选择常规点
+        remaining_count = count - len(selected)
+        if remaining_count > 0 and regular_points:
+            step = max(1, len(regular_points) // remaining_count)
+            for i in range(0, len(regular_points), step):
+                if len(selected) < count:
+                    selected.append(regular_points[i])
+        
+        return selected[:count]
     
-    def _create_single_ghost(self, ghost_path: str, node: PathNode):
+    def _create_single_ghost(self, ghost_path: str, point: CoveragePoint):
         """创建单个虚影"""
         stage = self.world.stage
         
@@ -460,9 +625,9 @@ class DynamicPathVisualizer:
         references = ghost_prim.GetReferences()
         references.AddReference(self.ghost_usd_path)
         
-        # 设置变换 - 使用正确的USD类型
-        ghost_position = Gf.Vec3d(float(node.position[0]), float(node.position[1]), float(node.position[2]))
-        yaw_degrees = float(np.degrees(node.orientation))
+        # 设置变换
+        ghost_position = Gf.Vec3d(float(point.position[0]), float(point.position[1]), float(point.position[2]))
+        yaw_degrees = float(np.degrees(point.orientation))
         
         xform = UsdGeom.Xformable(ghost_prim)
         xform.ClearXformOpOrder()
@@ -474,21 +639,28 @@ class DynamicPathVisualizer:
             rotate_op = xform.AddRotateZOp()
             rotate_op.Set(yaw_degrees)
     
-    def _select_nodes(self, path_nodes: List[PathNode], count: int) -> List[PathNode]:
-        """选择关键节点"""
-        if len(path_nodes) <= count:
-            return path_nodes
+    def _setup_line_material(self, line_prim, segment_index: int, color: List[float]):
+        """设置线条材质"""
+        material_path = f"/World/Materials/CoverageMaterial_{segment_index}"
+        stage = self.world.stage
         
-        selected = [path_nodes[0]]  # 起始点
+        material_prim = stage.DefinePrim(material_path, "Material")
+        material = UsdShade.Material(material_prim)
         
-        # 均匀分布
-        step = len(path_nodes) // (count - 1)
-        for i in range(1, count - 1):
-            index = min(i * step, len(path_nodes) - 1)
-            selected.append(path_nodes[index])
+        shader_prim = stage.DefinePrim(f"{material_path}/Shader", "Shader")
+        shader = UsdShade.Shader(shader_prim)
+        shader.CreateIdAttr("UsdPreviewSurface")
         
-        selected.append(path_nodes[-1])  # 终点
-        return selected
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(tuple(color))
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(tuple([c*0.3 for c in color]))
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.8)
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        
+        material_output = material.CreateSurfaceOutput()
+        shader_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+        material_output.ConnectToSource(shader_output)
+        
+        UsdShade.MaterialBindingAPI(line_prim).Bind(material)
     
     def _clear_ghosts(self):
         """清除虚影"""
@@ -498,23 +670,21 @@ class DynamicPathVisualizer:
         """清除线条"""
         stage = self.world.stage
         
-        # 删除所有线条prims
         for line_path in self.line_prims:
             if stage.GetPrimAtPath(line_path):
                 stage.RemovePrim(line_path)
         
         self.line_prims.clear()
         
-        # 删除线条容器
         if stage.GetPrimAtPath(self.line_container_path):
             stage.RemovePrim(self.line_container_path)
         
-        # 删除材质
+        # 清理材质
         materials_path = "/World/Materials"
         if stage.GetPrimAtPath(materials_path):
             materials_prim = stage.GetPrimAtPath(materials_path)
             for child in materials_prim.GetChildren():
-                if "LineMaterial" in str(child.GetPath()):
+                if "CoverageMaterial" in str(child.GetPath()):
                     stage.RemovePrim(child.GetPath())
     
     def _delete_entire_container(self, container_path: str):
@@ -523,7 +693,7 @@ class DynamicPathVisualizer:
         
         if stage.GetPrimAtPath(container_path):
             stage.RemovePrim(container_path)
-            for _ in range(5):
+            for _ in range(3):
                 self.world.step(render=False)
     
     def cleanup_all(self):
@@ -533,7 +703,7 @@ class DynamicPathVisualizer:
         self._clear_lines()
 
 class StabilizedRobotController:
-    """稳定机器人控制器"""
+    """稳定机器人控制器 - 覆盖模式"""
     
     def __init__(self, mobile_base, differential_controller):
         self.mobile_base = mobile_base
@@ -541,17 +711,13 @@ class StabilizedRobotController:
         self.max_linear_velocity = MAX_LINEAR_VELOCITY  
         self.max_angular_velocity = MAX_ANGULAR_VELOCITY
         
-        self.velocity_filter = deque(maxlen=5)
-        self.angular_filter = deque(maxlen=5)
+        self.velocity_filter = deque(maxlen=3)
+        self.angular_filter = deque(maxlen=3)
         
-        self.last_position = None
-        self.stuck_counter = 0
-        self.stuck_threshold = 100
-        
-        print("🎮 稳定控制器初始化")
+        print("🎮 稳定控制器初始化（覆盖模式）")
     
-    def send_stable_command(self, target_linear_vel: float, target_angular_vel: float):
-        """发送稳定控制命令"""
+    def send_coverage_command(self, target_linear_vel: float, target_angular_vel: float):
+        """发送覆盖移动命令"""
         target_linear_vel = np.clip(target_linear_vel, -self.max_linear_velocity, self.max_linear_velocity)
         target_angular_vel = np.clip(target_angular_vel, -self.max_angular_velocity, self.max_angular_velocity)
         
@@ -573,8 +739,8 @@ class StabilizedRobotController:
         left_wheel_vel = (linear_vel - angular_vel * wheel_base / 2.0) / wheel_radius
         right_wheel_vel = (linear_vel + angular_vel * wheel_base / 2.0) / wheel_radius
         
-        # 直线运动对称性
-        if abs(angular_vel) < 0.05:
+        # 覆盖模式的对称性控制
+        if abs(angular_vel) < 0.1:
             avg_vel = (left_wheel_vel + right_wheel_vel) / 2.0
             left_wheel_vel = avg_vel
             right_wheel_vel = avg_vel
@@ -590,55 +756,9 @@ class StabilizedRobotController:
         
         action = ArticulationAction(joint_velocities=joint_velocities)
         articulation_controller.apply_action(action)
-    
-    def check_movement_stability(self, current_position: np.ndarray) -> bool:
-        """检查运动稳定性"""
-        if self.last_position is not None:
-            movement = np.linalg.norm(current_position[:2] - self.last_position[:2])
-            
-            if movement < 0.005:
-                self.stuck_counter += 1
-            else:
-                self.stuck_counter = 0
-            
-            if self.stuck_counter >= self.stuck_threshold:
-                print("   检测到卡住，执行恢复...")
-                self._unstuck_recovery()
-                self.stuck_counter = 0
-                return False
-        
-        self.last_position = current_position.copy()
-        return True
-    
-    def _unstuck_recovery(self):
-        """解卡恢复"""
-        print("   执行解卡...")
-        
-        # 完全停止
-        for _ in range(8):
-            self.send_stable_command(0.0, 0.0)
-        
-        # 恢复动作
-        recovery_actions = [
-            (-0.1, 0.0),   # 后退
-            (0.0, 2.5),    # 左转
-            (0.0, -2.5),   # 右转
-            (-0.08, 2.0),  # 后退左转
-            (-0.08, -2.0), # 后退右转
-        ]
-        
-        for linear, angular in recovery_actions:
-            for _ in range(6):
-                self.send_stable_command(linear, angular)
-            for _ in range(2):
-                self.send_stable_command(0.0, 0.0)
-        
-        # 最终停止
-        for _ in range(6):
-            self.send_stable_command(0.0, 0.0)
 
-class OptimizedRobotSystem:
-    """优化版机器人系统 - 动态路径显示"""
+class FluentCoverageRobotSystem:
+    """流畅覆盖算法机器人系统"""
     
     def __init__(self):
         self.world = None
@@ -650,15 +770,14 @@ class OptimizedRobotSystem:
         self.current_position = np.array([0.0, 0.0, 0.0])
         self.current_orientation = 0.0
         
-        self.small_trash_objects = []
-        self.large_trash_objects = []
+        self.collectible_objects = []
         self.collected_objects = []
         
-        self.path_planner = None
-        self.path_visualizer = None  # 新的动态可视化器
+        self.coverage_planner = None
+        self.path_visualizer = None
+        self.coverage_visualizer = None
         
-        self.all_tasks = []
-        self.target_paths = {}
+        self.coverage_segments = []
         
         self.arm_poses = {
             "home": [0.0, -0.569, 0.0, -2.810, 0.0, 2.0, 0.741],
@@ -672,7 +791,7 @@ class OptimizedRobotSystem:
     
     def initialize_system(self):
         """初始化系统"""
-        print("🚀 初始化动态路径显示系统...")
+        print("🚀 初始化流畅覆盖机器人系统...")
         
         self.world = World(
             stage_units_in_meters=1.0,
@@ -692,7 +811,7 @@ class OptimizedRobotSystem:
             name="ground", 
             position=np.array([0.0, 0.0, -0.5]),
             scale=np.array([50.0, 50.0, 1.0]),
-            color=np.array([0.5, 0.5, 0.5])
+            color=np.array([0.4, 0.4, 0.4])
         )
         self.world.scene.add(ground)
         
@@ -717,18 +836,18 @@ class OptimizedRobotSystem:
     
     def _initialize_systems(self):
         """初始化系统组件"""
-        self.path_planner = LightweightPathPlanner(world_size=8.0, resolution=0.15)
-        self.path_visualizer = DynamicPathVisualizer(self.world)  # 使用动态可视化器
+        self.coverage_planner = CoveragePathPlanner(world_size=COVERAGE_AREA_SIZE, cell_size=COVERAGE_CELL_SIZE)
+        self.path_visualizer = DynamicPathVisualizer(self.world)
+        self.coverage_visualizer = FluentCoverageVisualizer(self.world)  # 使用流畅可视化器
         self._add_environment_obstacles()
     
     def _add_environment_obstacles(self):
         """添加环境障碍物"""
         obstacles = [
-            {"pos": [1.0, 0.5, 0.15], "size": [0.3, 0.3, 0.3], "color": [0.6, 0.3, 0.1], "name": "cylinder1", "shape": "cylinder"},
-            {"pos": [0.5, -1.2, 0.1], "size": [1.5, 0.2, 0.2], "color": [0.7, 0.7, 0.7], "name": "wall1", "shape": "box"},
-            {"pos": [-0.8, 0.8, 0.4], "size": [0.1, 0.8, 0.1], "color": [0.8, 0.2, 0.2], "name": "pole1", "shape": "box"},
-            {"pos": [-0.5, -0.8, 0.15], "size": [0.3, 0.3, 0.3], "color": [0.9, 0.5, 0.1], "name": "sphere1", "shape": "sphere"},
-            {"pos": [1.5, 1.8, 0.2], "size": [0.4, 0.4, 0.4], "color": [0.2, 0.8, 0.8], "name": "box1", "shape": "box"},
+            {"pos": [1.2, 0.8, 0.15], "size": [0.3, 0.3, 0.3], "color": [0.6, 0.3, 0.1], "name": "cylinder1", "shape": "cylinder"},
+            {"pos": [0.5, -1.5, 0.1], "size": [1.2, 0.2, 0.2], "color": [0.7, 0.7, 0.7], "name": "wall1", "shape": "box"},
+            {"pos": [-1.0, 1.2, 0.4], "size": [0.1, 0.8, 0.1], "color": [0.8, 0.2, 0.2], "name": "pole1", "shape": "box"},
+            {"pos": [-0.8, -1.0, 0.15], "size": [0.3, 0.3, 0.3], "color": [0.9, 0.5, 0.1], "name": "sphere1", "shape": "sphere"},
         ]
         
         for obs in obstacles:
@@ -750,7 +869,7 @@ class OptimizedRobotSystem:
                 )
             
             self.world.scene.add(obstacle)
-            self.path_planner.add_obstacle(
+            self.coverage_planner.add_obstacle(
                 np.array(obs["pos"]), 
                 np.array(obs["size"]),
                 obs["shape"]
@@ -818,7 +937,7 @@ class OptimizedRobotSystem:
         for wheel_name in ["left_wheel_joint", "right_wheel_joint"]:
             idx = self.mobile_base.dof_names.index(wheel_name)
             kp[idx] = 0.0
-            kd[idx] = 500.0
+            kd[idx] = 400.0
         
         # 机械臂控制
         arm_joint_names = [f"panda_joint{i+1}" for i in range(7)]
@@ -852,7 +971,7 @@ class OptimizedRobotSystem:
         action = ArticulationAction(joint_positions=joint_positions)
         articulation_controller.apply_action(action)
         
-        for _ in range(20):
+        for _ in range(15):
             self.world.step(render=False)
     
     def _control_gripper(self, open_close):
@@ -870,7 +989,7 @@ class OptimizedRobotSystem:
         action = ArticulationAction(joint_positions=joint_positions)
         articulation_controller.apply_action(action)
         
-        for _ in range(10):
+        for _ in range(8):
             self.world.step(render=False)
     
     def get_robot_pose(self):
@@ -889,226 +1008,142 @@ class OptimizedRobotSystem:
         
         return position.copy(), yaw
     
-    def create_trash_environment(self):
-        """创建垃圾环境"""
-        print("🗑️ 创建垃圾环境...")
+    def create_collectible_environment(self):
+        """创建可收集物体环境"""
+        print("📦 创建可收集物体环境...")
         
-        # 创建少量垃圾用于测试
-        small_trash_positions = [
-            [2.5, 0.0, 0.03], [2.0, 1.5, 0.03]
+        # 分布在覆盖区域内的物体
+        object_positions = [
+            [1.5, 0.5, 0.03], [2.0, 1.8, 0.03], [-0.5, 1.5, 0.03],
+            [0.8, -0.8, 0.03], [-1.5, 0.2, 0.03], [1.8, -1.2, 0.03],
+            [-0.2, -1.8, 0.03], [2.2, 0.0, 0.03]
         ]
         
-        for i, pos in enumerate(small_trash_positions):
-            trash = DynamicSphere(
-                prim_path=f"/World/small_trash_{i}",
-                name=f"small_trash_{i}",
-                position=np.array(pos),
-                radius=0.03,
-                color=np.array([1.0, 0.2, 0.2])
-            )
-            self.world.scene.add(trash)
-            self.small_trash_objects.append(trash)
+        for i, pos in enumerate(object_positions):
+            # 随机选择物体类型
+            if i % 2 == 0:
+                # 小球类物体
+                obj = DynamicSphere(
+                    prim_path=f"/World/collectible_{i}",
+                    name=f"collectible_{i}",
+                    position=np.array(pos),
+                    radius=0.04,
+                    color=np.array([0.2, 0.8, 0.2])
+                )
+            else:
+                # 立方体类物体
+                obj = DynamicCuboid(
+                    prim_path=f"/World/collectible_{i}",
+                    name=f"collectible_{i}",
+                    position=np.array(pos),
+                    scale=np.array([0.06, 0.06, 0.06]),
+                    color=np.array([0.8, 0.2, 0.8])
+                )
+            
+            self.world.scene.add(obj)
+            self.collectible_objects.append(obj)
         
-        large_trash_positions = [
-            [2.8, 1.0, 0.025]
-        ]
+        # 将物体位置传递给路径规划器
+        object_world_positions = [obj.get_world_pose()[0] for obj in self.collectible_objects]
+        self.coverage_planner.add_objects(object_world_positions)
         
-        for i, pos in enumerate(large_trash_positions):
-            trash = DynamicCuboid(
-                prim_path=f"/World/large_trash_{i}",
-                name=f"large_trash_{i}",
-                position=np.array(pos),
-                scale=np.array([0.05, 0.05, 0.05]),
-                color=np.array([0.2, 0.8, 0.2])
-            )
-            self.world.scene.add(trash)
-            self.large_trash_objects.append(trash)
-        
-        print(f"✅ 环境创建完成: 小垃圾{len(self.small_trash_objects)}个, 大垃圾{len(self.large_trash_objects)}个")
-        print_memory_usage("垃圾环境创建完成")
+        print(f"✅ 环境创建完成: 可收集物体{len(self.collectible_objects)}个")
+        print_memory_usage("物体环境创建完成")
     
-    def plan_mission(self):
-        """任务规划"""
-        print("\n🎯 开始任务规划...")
+    def plan_coverage_mission(self):
+        """覆盖任务规划"""
+        print("\n🌀 开始覆盖任务规划...")
         
-        self.all_tasks = []
         current_pos, _ = self.get_robot_pose()
         
-        # 小垃圾任务
-        for trash in self.small_trash_objects:
-            trash_pos = trash.get_world_pose()[0]
-            task = TaskInfo(
-                target_name=trash.name,
-                target_position=trash_pos,
-                task_type="small_trash",
-                approach_pose="carry"
-            )
-            self.all_tasks.append(task)
+        # 生成覆盖路径
+        self.coverage_segments = self.coverage_planner.generate_coverage_path(current_pos)
         
-        # 大垃圾任务
-        for trash in self.large_trash_objects:
-            trash_pos = trash.get_world_pose()[0]
-            task = TaskInfo(
-                target_name=trash.name,
-                target_position=trash_pos,
-                task_type="large_trash",
-                approach_pose="ready"
-            )
-            self.all_tasks.append(task)
-        
-        self._plan_paths()
-        print(f"✅ 任务规划完成: {len(self.all_tasks)}个目标")
-        print_memory_usage("任务规划完成")
+        total_points = sum(len(seg.points) for seg in self.coverage_segments)
+        print(f"✅ 覆盖规划完成: {len(self.coverage_segments)}个段, {total_points}个点")
+        print(f"🎨 流畅可视化: 精细网格{FINE_GRID_SIZE}m, 实时跟随机器人移动")
+        print_memory_usage("覆盖规划完成")
     
-    def _plan_paths(self):
-        """路径规划"""
-        print("🗺️ 路径规划...")
-        
-        current_pos, current_yaw = self.get_robot_pose()
-        
-        for target_index, task in enumerate(self.all_tasks):
-            print(f"   规划目标 {target_index}: {task.target_name}")
-            
-            target_pos = task.target_position.copy()
-            target_pos[2] = 0.0
-            
-            safe_path = self.path_planner.find_safe_path(current_pos, target_pos)
-            
-            # 生成路径节点
-            path_nodes = []
-            for i, point in enumerate(safe_path):
-                if i < len(safe_path) - 1:
-                    direction = np.array(safe_path[i + 1]) - np.array(point)
-                    orientation = np.arctan2(direction[1], direction[0])
-                else:
-                    orientation = path_nodes[-1].orientation if path_nodes else current_yaw
-                
-                arm_config = self.arm_poses[task.approach_pose]
-                node_position = np.array([point[0], point[1], 0.0])
-                
-                node = PathNode(
-                    position=node_position,
-                    orientation=orientation,
-                    arm_config=arm_config.copy(),
-                    gripper_state=self.gripper_open,
-                    timestamp=i * 0.1,
-                    node_id=i,
-                    action_type="move",
-                    target_index=target_index
-                )
-                path_nodes.append(node)
-            
-            self.target_paths[target_index] = path_nodes
-            current_pos = target_pos.copy()
-            print(f"     路径节点: {len(path_nodes)} 个")
-    
-    def execute_mission(self):
-        """执行任务"""
-        print("\n🚀 开始执行动态路径显示任务...")
+    def execute_coverage_mission(self):
+        """执行覆盖任务"""
+        print("\n🚀 开始执行流畅覆盖任务...")
         print_memory_usage("任务开始前")
-        print_stage_statistics(self.world.stage, "任务开始前")
         
-        for target_index, task in enumerate(self.all_tasks):
-            print(f"\n🎯 执行目标 {target_index}: {task.target_name}")
+        for segment_index, segment in enumerate(self.coverage_segments):
+            print(f"\n🌀 执行覆盖段 {segment_index}: {segment.segment_type}")
+            print(f"   段点数: {len(segment.points)}")
             
-            current_pos, current_yaw = self.get_robot_pose()
-            print(f"   当前位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}]")
-            print(f"   目标位置: [{task.target_position[0]:.3f}, {task.target_position[1]:.3f}]")
-            
-            path_nodes = self.target_paths[target_index]
-            
-            # 使用动态可视化器
-            print(f"🎨 ====== 目标{target_index}路径可视化开始 ======")
-            print_memory_usage(f"目标{target_index}可视化前")
-            self.path_visualizer.visualize_path(target_index, path_nodes)
-            print_memory_usage(f"目标{target_index}可视化后")
-            print(f"🎨 ====== 目标{target_index}路径可视化完成 ======")
+            # 可视化当前段
+            print(f"🎨 ====== 段{segment_index}路径可视化开始 ======")
+            self.path_visualizer.visualize_coverage_segment(segment_index, segment)
+            print(f"🎨 ====== 段{segment_index}路径可视化完成 ======")
             
             # 展示路径
-            display_steps = GHOST_DISPLAY_STEPS if self.path_visualizer.current_strategy == "ghost" else 15
-            strategy_name = "虚影" if self.path_visualizer.current_strategy == "ghost" else "2D贴地线条"
-            print(f"👁️ 展示路径 ({display_steps}步, 策略:{strategy_name})...")
+            display_steps = GHOST_DISPLAY_STEPS if self.path_visualizer.current_strategy == "ghost" else 10
+            print(f"👁️ 展示覆盖路径 ({display_steps}步)...")
             for step in range(display_steps):
                 self.world.step(render=True)
-                if step % 5 == 0:
-                    print(f"   展示进度: {step}/{display_steps}")
             
-            # 执行路径
-            print(f"🏃 执行路径（{len(path_nodes)}个节点）...")
-            self._execute_path(path_nodes, task)
+            # 执行覆盖段
+            print(f"🏃 执行流畅覆盖移动...")
+            self._execute_fluent_coverage_segment(segment)
             
             # 清除可视化
-            print(f"🧹 ====== 目标{target_index}路径清理开始 ======")
-            print_memory_usage(f"目标{target_index}清理前")
-            self.path_visualizer.clear_current_visualization(target_index)
-            print_memory_usage(f"目标{target_index}清理后")
-            print(f"🧹 ====== 目标{target_index}路径清理完成 ======")
+            print(f"🧹 清理段{segment_index}可视化...")
+            self.path_visualizer._clear_ghosts()
+            self.path_visualizer._clear_lines()
             
-            # 强制垃圾回收
-            print(f"🔄 执行强制垃圾回收...")
-            for i in range(5):
+            # 垃圾回收
+            for i in range(2):
                 gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 self.world.step(render=False)
             
-            print(f"✅ 目标 {target_index} 完成")
-            print_stage_statistics(self.world.stage, f"目标{target_index}完成后")
-            print_memory_usage(f"目标{target_index}最终内存")
+            print(f"✅ 流畅覆盖段 {segment_index} 完成")
         
-        print("\n🎉 所有目标执行完成!")
-        print_memory_usage("所有任务完成后")
-        print_stage_statistics(self.world.stage, "所有任务完成后")
-        self._show_results()
+        print("\n🎉 流畅覆盖任务执行完成!")
+        self._show_fluent_coverage_results()
     
-    def _execute_path(self, path_nodes: List[PathNode], task: TaskInfo):
-        """执行路径"""
-        for i, node in enumerate(path_nodes):
-            success = self._navigate_to_node(node, tolerance=NAVIGATION_TOLERANCE)
+    def _execute_fluent_coverage_segment(self, segment: CoverageSegment):
+        """执行流畅覆盖段"""
+        for i, point in enumerate(segment.points):
+            # 导航到覆盖点
+            success = self._navigate_to_coverage_point(point)
             
-            if not success:
-                print(f"   节点 {i} 导航失败，继续...")
-                continue
+            current_pos, _ = self.get_robot_pose()
             
-            # 检查任务完成
-            task_distance = np.linalg.norm(node.position[:2] - task.target_position[:2])
-            if task_distance < 0.4 and task.target_name not in self.collected_objects:
-                print(f"🎯 到达任务目标: {task.target_name}")
-                self._execute_task_action(task)
-                self._post_task_calibration()
-                return True
+            # 实时流畅标记覆盖区域
+            self.coverage_visualizer.mark_coverage_realtime(current_pos)
+            
+            # 检查是否有物体需要收集
+            self._check_and_collect_nearby_objects(current_pos)
             
             # 进度显示
             if i % 3 == 0:
-                progress = (i / len(path_nodes)) * 100
-                print(f"   路径进度: {progress:.1f}%")
-        
-        return True
+                progress = (i / len(segment.points)) * 100
+                print(f"   流畅覆盖进度: {progress:.1f}%")
     
-    def _navigate_to_node(self, node: PathNode, tolerance: float = None) -> bool:
-        """导航到节点"""
-        if tolerance is None:
-            tolerance = NAVIGATION_TOLERANCE
-            
-        max_time = MAX_NAVIGATION_TIME
-        start_time = time.time()
+    def _navigate_to_coverage_point(self, point: CoveragePoint) -> bool:
+        """导航到覆盖点 - 流畅移动优化"""
+        # 更精细的容差，配合流畅可视化
+        tolerance = FINE_GRID_SIZE  # 使用精细网格大小作为容差
+        max_steps = 150
         step_counter = 0
         
-        print(f"   导航到: [{node.position[0]:.2f}, {node.position[1]:.2f}]")
-        
-        while time.time() - start_time < max_time:
+        while step_counter < max_steps:
             current_pos, current_yaw = self.get_robot_pose()
             step_counter += 1
             
+            # 实时更新流畅覆盖标记
+            self.coverage_visualizer.mark_coverage_realtime(current_pos)
+            
             # 检查到达
-            distance = np.linalg.norm(current_pos[:2] - node.position[:2])
+            distance = np.linalg.norm(current_pos[:2] - point.position[:2])
             if distance < tolerance:
-                self.stabilized_controller.send_stable_command(0.0, 0.0)
-                print(f"   到达节点，距离: {distance:.3f}m")
+                self.stabilized_controller.send_coverage_command(0.0, 0.0)
                 return True
             
             # 计算控制量
-            direction = node.position[:2] - current_pos[:2]
+            direction = point.position[:2] - current_pos[:2]
             target_angle = np.arctan2(direction[1], direction[0])
             angle_diff = target_angle - current_yaw
             
@@ -1118,159 +1153,97 @@ class OptimizedRobotSystem:
             while angle_diff < -np.pi:
                 angle_diff += 2 * np.pi
             
-            # 控制策略
-            if abs(angle_diff) > 0.1:
+            # 流畅覆盖移动控制策略
+            if abs(angle_diff) > 0.15:
                 linear_vel = 0.0
-                angular_vel = np.clip(angle_diff * TURN_GAIN, -MAX_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY)
-                if step_counter % 500 == 0:
-                    print(f"   转弯: 角度差={np.degrees(angle_diff):.1f}°")
+                angular_vel = np.clip(angle_diff * 4.0, -MAX_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY)
             else:
-                linear_vel = min(MAX_LINEAR_VELOCITY, max(0.06, distance * 0.6))
-                angular_vel = np.clip(angle_diff * FORWARD_ANGLE_GAIN, -2.0, 2.0)
-                if step_counter % 500 == 0:
-                    print(f"   前进: 距离={distance:.2f}m")
+                linear_vel = min(MAX_LINEAR_VELOCITY, max(0.05, distance * 0.8))
+                angular_vel = np.clip(angle_diff * 2.0, -1.5, 1.5)
             
-            self.stabilized_controller.send_stable_command(linear_vel, angular_vel)
-            
-            # 稳定性检查
-            if not self.stabilized_controller.check_movement_stability(current_pos):
-                print(f"   稳定性检查失败")
-                for _ in range(3):
-                    self.stabilized_controller.send_stable_command(0.0, 0.0)
-                    self.world.step(render=True)
-            
+            self.stabilized_controller.send_coverage_command(linear_vel, angular_vel)
             self.world.step(render=True)
         
-        # 超时
-        print(f"   导航超时")
-        self.stabilized_controller.send_stable_command(0.0, 0.0)
+        # 超时停止
+        self.stabilized_controller.send_coverage_command(0.0, 0.0)
         return False
     
-    def _execute_task_action(self, task: TaskInfo):
-        """执行任务动作"""
-        print(f"🎯 执行任务: {task.target_name}")
-        
-        if task.task_type == "small_trash":
-            self._collect_small_trash(task)
-        elif task.task_type == "large_trash":
-            self._collect_large_trash(task)
-    
-    def _collect_small_trash(self, task: TaskInfo):
-        """收集小垃圾"""
-        self._move_arm_to_pose("carry")
-        
-        for trash in self.small_trash_objects:
-            if trash.name == task.target_name:
-                self._safely_remove_trash(trash)
-                self.collected_objects.append(task.target_name)
-                print(f"✅ {task.target_name} 收集成功!")
+    def _check_and_collect_nearby_objects(self, robot_pos: np.ndarray):
+        """检查并收集附近物体 - 基于实际底盘半径"""
+        for obj in self.collectible_objects:
+            if obj.name in self.collected_objects:
+                continue
+                
+            obj_pos = obj.get_world_pose()[0]
+            distance = np.linalg.norm(robot_pos[:2] - obj_pos[:2])
+            
+            # 使用底盘半径作为收集距离
+            if distance < COVERAGE_MARK_RADIUS:
+                print(f"🎯 收集物体: {obj.name} (距离: {distance:.2f}m)")
+                self._collect_object(obj)
+                self.collected_objects.append(obj.name)
                 break
     
-    def _collect_large_trash(self, task: TaskInfo):
-        """收集大垃圾"""
+    def _collect_object(self, obj):
+        """收集物体"""
+        # 快速机械臂动作
         self._move_arm_to_pose("ready")
         self._control_gripper("open")
-        self._move_arm_to_pose("pickup")
         self._control_gripper("close")
         self._move_arm_to_pose("carry")
         
-        for trash in self.large_trash_objects:
-            if trash.name == task.target_name:
-                self._safely_remove_trash(trash)
-                self.collected_objects.append(task.target_name)
-                print(f"✅ {task.target_name} 收集成功!")
-                break
-    
-    def _safely_remove_trash(self, trash_object):
-        """安全移除垃圾对象"""
-        print(f"   隐藏垃圾: {trash_object.name}")
-        
-        # 禁用物理
-        trash_object.disable_rigid_body_physics()
-        
-        # 移动到远处
+        # 隐藏物体
+        obj.disable_rigid_body_physics()
         far_away_position = np.array([100.0, 100.0, -5.0])
-        trash_object.set_world_pose(far_away_position, np.array([0, 0, 0, 1]))
-        
-        # 设置不可见
-        trash_object.set_visibility(False)
-        
-        # 等待更新
-        for _ in range(3):
-            self.world.step(render=False)
-    
-    def _post_task_calibration(self):
-        """任务后校准"""
-        print(f"   位置校准...")
-        
-        # 完全停止
-        for _ in range(12):
-            self.stabilized_controller.send_stable_command(0.0, 0.0)
-            self.world.step(render=False)
-        
-        # 重置控制器状态
-        self.stabilized_controller.stuck_counter = 0
-        current_pos, _ = self.get_robot_pose()
-        self.stabilized_controller.last_position = current_pos.copy()
-        
-        # 清空滤波器
-        self.stabilized_controller.velocity_filter.clear()
-        self.stabilized_controller.angular_filter.clear()
-        
-        # 小幅调整
-        for _ in range(2):
-            self.stabilized_controller.send_stable_command(0.0, 1.2)
-            self.world.step(render=False)
+        obj.set_world_pose(far_away_position, np.array([0, 0, 0, 1]))
+        obj.set_visibility(False)
         
         for _ in range(2):
-            self.stabilized_controller.send_stable_command(0.0, -1.2)
             self.world.step(render=False)
-        
-        # 最终停止
-        for _ in range(8):
-            self.stabilized_controller.send_stable_command(0.0, 0.0)
-            self.world.step(render=False)
-        
-        print(f"   校准完成")
     
-    def _show_results(self):
-        """显示结果"""
-        total_items = len(self.small_trash_objects) + len(self.large_trash_objects)
-        success_count = len(self.collected_objects)
-        success_rate = (success_count / total_items) * 100 if total_items > 0 else 0.0
+    def _show_fluent_coverage_results(self):
+        """显示流畅覆盖结果"""
+        total_objects = len(self.collectible_objects)
+        collected_count = len(self.collected_objects)
+        collection_rate = (collected_count / total_objects) * 100
         
-        total_nodes = sum(len(path) for path in self.target_paths.values())
+        coverage_count = len(self.coverage_visualizer.coverage_marks)
+        total_points = sum(len(seg.points) for seg in self.coverage_segments)
         
-        print(f"\n📊 动态路径显示任务执行结果:")
-        print(f"   总目标数: {len(self.all_tasks)}")
-        print(f"   总垃圾数: {total_items}")
-        print(f"   成功收集: {success_count}")
-        print(f"   成功率: {success_rate:.1f}%")
-        print(f"   总路径节点: {total_nodes}")
-        print(f"   内存阈值: {MEMORY_THRESHOLD_MB}MB")
-        print(f"🎨 动态策略: 智能切换虚影/2D贴地线条")
-        print(f"👻 虚影数量: 3-5个（根据路径长度动态调整）")
-        print(f"📏 线条显示: 超薄贴地，不遮挡机器人视野")
-        print(f"✅ 资源占用得到有效控制")
-        print(f"✅ 避免内存溢出问题")
+        print(f"\n📊 流畅覆盖任务执行结果:")
+        print(f"   覆盖段数: {len(self.coverage_segments)}")
+        print(f"   总覆盖点: {total_points}")
+        print(f"   流畅标记区域: {coverage_count}")
+        print(f"   总物体数: {total_objects}")
+        print(f"   成功收集: {collected_count}")
+        print(f"   收集率: {collection_rate:.1f}%")
+        print(f"🤖 底盘参数: 半径{COVERAGE_MARK_RADIUS}m, 直径{COVERAGE_MARK_RADIUS*2}m")
+        print(f"🌀 覆盖算法: 智能蛇形覆盖，网格{COVERAGE_CELL_SIZE}m")
+        print(f"🎨 流畅可视化: 精细网格{FINE_GRID_SIZE}m，实时跟随机器人移动")
+        print(f"✨ 流畅标记: 绿色渐变圆盘，颗粒度精细，连贯流畅")
+        print(f"🤖 智能结合: 流畅覆盖移动 + 实时标记 + 物体收集")
+        print(f"📏 路径优化: 避免过度重叠，提高覆盖效率")
+        print(f"✅ 高效完成流畅区域覆盖任务")
     
-    def run_demo(self):
-        """运行演示"""
+    def run_fluent_coverage_demo(self):
+        """运行流畅覆盖演示"""
         print("\n" + "="*80)
-        print("🚀 动态路径显示系统 - Isaac Sim 4.5")
-        print("🎨 智能切换策略 | 👻 虚影 ⟷ 📏 2D贴地线条 | 🛡️ 防止资源溢出")
+        print("🌀 流畅覆盖算法机器人系统 - Isaac Sim 4.5")
+        print("🤖 流畅覆盖 | 📦 智能收集 | 🎨 实时标记 | ⚡ 精细高效")
+        print(f"🔧 底盘半径: {COVERAGE_MARK_RADIUS}m | 精细网格: {FINE_GRID_SIZE}m")
         print("="*80)
         
         pos, yaw = self.get_robot_pose()
         print(f"📍 初始位置: [{pos[0]:.3f}, {pos[1]:.3f}], 朝向: {np.degrees(yaw):.1f}°")
         
-        self.plan_mission()
-        self.execute_mission()
+        self.plan_coverage_mission()
+        self.execute_coverage_mission()
         
         self._move_arm_to_pose("home")
         
-        print("\n🎉 动态路径显示系统演示完成!")
-        print("💡 智能策略确保了资源的高效利用")
+        print("\n🎉 流畅覆盖系统演示完成!")
+        print("💡 成功实现流畅区域覆盖与物体收集的智能结合")
+        print(f"🎨 流畅标记实时跟随机器人，精细网格{FINE_GRID_SIZE}m")
     
     def cleanup(self):
         """清理资源"""
@@ -1279,22 +1252,21 @@ class OptimizedRobotSystem:
         
         if self.path_visualizer is not None:
             self.path_visualizer.cleanup_all()
+        
+        if self.coverage_visualizer is not None:
+            self.coverage_visualizer.cleanup()
             
-        print("   强制垃圾回收...")
-        for i in range(10):
+        for i in range(8):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
         if self.world is not None:
-            print("   清理物理世界...")
-            for _ in range(8):
+            for _ in range(5):
                 self.world.step(render=False)
-            
             self.world.stop()
-            print("   世界停止完成")
         
-        for i in range(5):
+        for i in range(3):
             gc.collect()
         
         print_memory_usage("最终清理后")
@@ -1302,18 +1274,21 @@ class OptimizedRobotSystem:
 
 def main():
     """主函数"""
-    print("🚀 启动动态路径显示系统...")
+    print("🌀 启动流畅覆盖算法机器人系统...")
+    print(f"⚙️ 底盘参数: 半径={COVERAGE_MARK_RADIUS}m, 直径={COVERAGE_MARK_RADIUS*2}m")
+    print(f"⚙️ 覆盖参数: 网格={COVERAGE_CELL_SIZE}m, 区域={COVERAGE_AREA_SIZE}m")
+    print(f"⚙️ 流畅参数: 精细网格={FINE_GRID_SIZE}m, 更新频率={COVERAGE_UPDATE_FREQUENCY}")
     print(f"⚙️ 运动参数: 线速度={MAX_LINEAR_VELOCITY}m/s, 角速度={MAX_ANGULAR_VELOCITY}rad/s")
-    print(f"⚙️ 显示设置: 虚影3-5个(根据路径长度), 2D贴地线条")
-    print(f"⚙️ 内存管理: 阈值={MEMORY_THRESHOLD_MB}MB")
-    print(f"🎨 智能策略: 动态切换虚影/2D贴地线条显示")
+    print(f"🎨 流畅可视化: 绿色渐变圆盘标记，实时跟随机器人移动，颗粒度精细")
+    print(f"🤖 智能算法: 蛇形覆盖 + 流畅标记 + 机会式物体收集")
+    print(f"📏 路径优化: 适配{COVERAGE_MARK_RADIUS}m底盘，避免过度重叠，连贯流畅")
     
-    system = OptimizedRobotSystem()
+    system = FluentCoverageRobotSystem()
     
     system.initialize_system()
     system.initialize_robot()
     system.setup_post_load()
-    system.create_trash_environment()
+    system.create_collectible_environment()
     
     # 稳定系统
     print("⚡ 系统稳定中...")
@@ -1322,11 +1297,11 @@ def main():
         time.sleep(0.01)
     
     # 运行演示
-    system.run_demo()
+    system.run_fluent_coverage_demo()
     
-    # 保持运行一段时间用于观察
-    print("\n💡 系统运行中，按 Ctrl+C 退出")
-    for i in range(100):
+    # 保持运行用于观察
+    print("\n💡 系统运行中，观察流畅覆盖效果...")
+    for i in range(50):
         system.world.step(render=True)
         time.sleep(0.1)
     
