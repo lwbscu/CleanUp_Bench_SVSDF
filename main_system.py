@@ -36,6 +36,40 @@ simulation_app = SimulationApp({
     "rendering_dt": 1.0/30.0,
 })
 
+# 添加这段：检查并启用ROS Bridge
+print("检查ROS Bridge扩展状态...")
+import omni.kit.app
+import carb
+
+# 获取扩展管理器
+ext_manager = omni.kit.app.get_app().get_extension_manager()
+
+# 检查ROS Bridge是否启用
+if not ext_manager.is_extension_enabled("omni.isaac.ros_bridge"):
+    print("启用ROS Bridge扩展...")
+    ext_manager.set_extension_enabled_immediate("omni.isaac.ros_bridge", True)
+    print("ROS Bridge扩展已启用")
+else:
+    print("ROS Bridge扩展已经启用")
+
+# 等待扩展完全加载
+simulation_app.update()
+simulation_app.update()
+simulation_app.update()
+
+# 检查roscore连接
+print("检查roscore连接...")
+try:
+    import rosgraph
+    if not rosgraph.is_master_online():
+        carb.log_warn("roscore未运行，请先运行: roscore")
+        print("警告: roscore未运行，请在另一个终端先运行: roscore")
+    else:
+        print("roscore连接正常")
+except ImportError:
+    print("警告: 无法导入rosgraph，请确保ROS环境正确设置")
+
+
 # 现在安全导入Isaac Sim核心模块
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid, DynamicSphere
@@ -166,7 +200,7 @@ class FourObjectCoverageSystem:
         
         # 4. KLT框子任务区域 - 使用自定义USD资产，放大尺寸
         klt_box_config = [
-            {"pos": [5, 0, 0.15], "size": [1.6, 0.8, 0.3], "usd_path": self.klt_box_usd_path, "shape": "usd_asset"},  # 尺寸放大2倍
+            {"pos": [5, 0, 0.1], "size": [1.6, 0.8, 0.3], "usd_path": self.klt_box_usd_path, "shape": "usd_asset"},  # 尺寸放大2倍
         ]
         
         # 创建所有对象
@@ -181,11 +215,15 @@ class FourObjectCoverageSystem:
             for i, config in enumerate(config_list):
                 self._create_scene_object(config, obj_type, i)
         
+        # 5. 添加外围围墙 - 确保足够远离任务区域
+        self._create_boundary_walls()
+        
         print(f"四类对象环境创建完成:")
         print(f"  障碍物: {len(obstacles_config)}个")
         print(f"  清扫目标: {len(sweep_config)}个") 
         print(f"  抓取物体: {len(grasp_config)}个")
         print(f"  KLT框子任务区域: {len(klt_box_config)}个")
+        print(f"  外围围墙: 已创建")
     
     def _create_scene_object(self, config: Dict, obj_type: ObjectType, index: int):
         """创建场景对象 - 支持USD资产加载"""
@@ -261,6 +299,114 @@ class FourObjectCoverageSystem:
         
         print(f"创建{obj_type.value}对象: {name}")
     
+    def _create_boundary_walls(self):
+        """创建外围围墙 - 确保远离所有任务区域"""
+        print("创建外围围墙...")
+        
+        # 分析当前所有对象的分布范围
+        all_positions = []
+        for obj in self.scene_objects:
+            all_positions.append(obj.position[:2])  # 只考虑x,y坐标
+        
+        if all_positions:
+            positions_array = np.array(all_positions)
+            min_x, min_y = positions_array.min(axis=0)
+            max_x, max_y = positions_array.max(axis=0)
+            
+            # 额外扩展围墙范围，确保充足的安全距离
+            wall_margin = 8.0  # 围墙距离最远对象的安全距离
+            wall_x_range = max(abs(min_x), abs(max_x)) + wall_margin
+            wall_y_range = max(abs(min_y), abs(max_y)) + wall_margin
+            
+            print(f"  对象分布范围: X[{min_x:.1f}, {max_x:.1f}], Y[{min_y:.1f}, {max_y:.1f}]")
+            print(f"  围墙安全距离: {wall_margin}m")
+            print(f"  围墙范围: X[±{wall_x_range:.1f}], Y[±{wall_y_range:.1f}]")
+        else:
+            # 默认围墙范围
+            wall_x_range = 15.0
+            wall_y_range = 15.0
+            print(f"  使用默认围墙范围: ±{wall_x_range}m")
+        
+        # 围墙配置参数
+        wall_thickness = 0.5  # 围墙厚度
+        wall_height = 2.0     # 围墙高度
+        wall_color = [0.6, 0.6, 0.6]  # 灰色围墙
+        
+        # 创建四面围墙
+        walls_config = [
+            # 北墙 (上方)
+            {
+                "name": "north_wall",
+                "pos": [0.0, wall_y_range + wall_thickness/2, wall_height/2],
+                "size": [wall_x_range*2 + wall_thickness*2, wall_thickness, wall_height],
+                "color": wall_color
+            },
+            # 南墙 (下方)
+            {
+                "name": "south_wall", 
+                "pos": [0.0, -(wall_y_range + wall_thickness/2), wall_height/2],
+                "size": [wall_x_range*2 + wall_thickness*2, wall_thickness, wall_height],
+                "color": wall_color
+            },
+            # 东墙 (右侧)
+            {
+                "name": "east_wall",
+                "pos": [wall_x_range + wall_thickness/2, 0.0, wall_height/2],
+                "size": [wall_thickness, wall_y_range*2, wall_height],
+                "color": wall_color
+            },
+            # 西墙 (左侧)
+            {
+                "name": "west_wall",
+                "pos": [-(wall_x_range + wall_thickness/2), 0.0, wall_height/2],
+                "size": [wall_thickness, wall_y_range*2, wall_height],
+                "color": wall_color
+            }
+        ]
+        
+        # 创建围墙对象
+        for i, wall_config in enumerate(walls_config):
+            wall_name = wall_config["name"]
+            prim_path = f"/World/BoundaryWalls/{wall_name}"
+            
+            # 创建固定围墙
+            wall_obj = FixedCuboid(
+                prim_path=prim_path,
+                name=wall_name,
+                position=np.array(wall_config["pos"]),
+                scale=np.array(wall_config["size"]),
+                color=np.array(wall_config["color"])
+            )
+            
+            self.world.scene.add(wall_obj)
+            
+            # 创建碰撞边界
+            collision_boundary = CollisionBoundary(
+                center=np.array(wall_config["pos"]),
+                shape_type="box",
+                dimensions=np.array(wall_config["size"])
+            )
+            
+            # 创建场景对象并添加到路径规划器
+            scene_obj = SceneObject(
+                name=wall_name,
+                object_type=ObjectType.OBSTACLE,  # 围墙作为障碍物处理
+                position=np.array(wall_config["pos"]),
+                collision_boundary=collision_boundary,
+                isaac_object=wall_obj,
+                color=np.array(wall_config["color"]),
+                original_position=np.array(wall_config["pos"])
+            )
+            
+            self.scene_objects.append(scene_obj)
+            self.path_planner.add_scene_object(scene_obj)
+            
+            print(f"    创建围墙: {wall_name} at [{wall_config['pos'][0]:.1f}, {wall_config['pos'][1]:.1f}, {wall_config['pos'][2]:.1f}]")
+        
+        print(f"  外围围墙创建完成: 4面围墙")
+        print(f"  围墙参数: 厚度{wall_thickness}m, 高度{wall_height}m")
+        print(f"  围墙已添加到路径规划避障系统")
+    
     def _create_klt_box_task_area(self, config: Dict, prim_path: str, name: str):
         """创建KLT框子任务区域"""
         try:
@@ -318,7 +464,7 @@ class FourObjectCoverageSystem:
         """初始化机器人"""
         print("初始化机器人...")
         
-        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm2.usd"
+        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm4.usd"
         print(f"使用机器人资产: {robot_usd_path}")
         
         self.mobile_base = WheeledRobot(

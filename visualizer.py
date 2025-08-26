@@ -158,7 +158,7 @@ class RealMovementVisualizer:
         self.stage = world.stage
         
         # USD资产路径
-        self.real_robot_usd = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm2.usd"
+        self.real_robot_usd = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm4.usd"
         self.ghost_robot_usd = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm3.usd"
         
         # 容器路径
