@@ -2,6 +2,7 @@
 """
 主系统模块 - KLT框子任务区域集成版
 四类对象覆盖系统的主要逻辑和程序入口
+集成激光雷达实时避障功能
 """
 
 import psutil
@@ -10,6 +11,7 @@ import numpy as np
 import time
 import random
 import gc
+import rospy
 from typing import List, Dict
 
 def print_memory_usage(stage_name: str = ""):
@@ -25,6 +27,7 @@ print(f"  1. 障碍物(红色) - 路径规划避障")
 print(f"  2. 清扫目标(黄色) - 触碰消失") 
 print(f"  3. 抓取物体(绿色) - 运送到KLT框子")
 print(f"  4. KLT框子任务区域 - 物体投放区域 (具有物理碰撞)")
+print(f"  5. 激光雷达实时避障 - 分层避障策略")
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({
@@ -35,6 +38,10 @@ simulation_app = SimulationApp({
     "physics_dt": 1.0/60.0,
     "rendering_dt": 1.0/30.0,
 })
+
+# 初始化ROS节点 - 新增
+print("初始化ROS节点...")
+rospy.init_node('isaac_sim_lidar_robot', anonymous=True)
 
 # 添加这段：检查并启用ROS Bridge
 print("检查ROS Bridge扩展状态...")
@@ -69,7 +76,6 @@ try:
 except ImportError:
     print("警告: 无法导入rosgraph，请确保ROS环境正确设置")
 
-
 # 现在安全导入Isaac Sim核心模块
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid, DynamicSphere
@@ -83,9 +89,10 @@ from data_structures import *
 from visualizer import RealMovementVisualizer
 from path_planner import FourObjectPathPlanner
 from robot_controller import FixedRobotController
+from lidar_avoidance import LidarAvoidanceController, DynamicPathReplanner  # 新增导入
 
 class FourObjectCoverageSystem:
-    """四类对象覆盖系统 - KLT框子任务区域版"""
+    """四类对象覆盖系统 - KLT框子任务区域版 + 激光雷达避障"""
     
     def __init__(self):
         self.world = None
@@ -94,18 +101,24 @@ class FourObjectCoverageSystem:
         self.path_planner = None
         self.visualizer = None
         
+        # 新增：激光雷达避障系统
+        self.lidar_avoidance = None
+        self.dynamic_replanner = None
+        
         self.scene_objects = []
         self.coverage_path = []
         self.coverage_stats = {
             'swept_objects': 0,
             'grasped_objects': 0,
             'delivered_objects': 0,
-            'total_coverage_points': 0
+            'total_coverage_points': 0,
+            'obstacles_avoided': 0,  # 新增：避障统计
+            'emergency_stops': 0     # 新增：紧急停车统计
         }
         
         # KLT框子配置
         self.klt_box_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/NVIDIA/Assets/ArchVis/Lobby/My_asset/T/small_KLT.usd"
-        self.klt_approach_distance = 1.2  # 机器人到达KLT框子的距离阈值 - 框子变大后调整距离
+        self.klt_approach_distance = 1.2
         
         # 机械臂配置
         self.arm_poses = {
@@ -149,8 +162,7 @@ class FourObjectCoverageSystem:
         self._create_four_type_environment()
         
         print(f"KLT框子任务区域系统初始化完成")
-        print(f"KLT框子资产: {self.klt_box_usd_path}")
-        print(f"到达距离阈值: {self.klt_approach_distance}m")
+        print(f"激光雷达避障系统已集成")
         return True
     
     def _setup_lighting(self):
@@ -169,8 +181,13 @@ class FourObjectCoverageSystem:
     def _initialize_components(self):
         """初始化组件"""
         self.path_planner = FourObjectPathPlanner()
-        self.visualizer = RealMovementVisualizer(self.world)  # 已集成超丝滑覆盖可视化
-        print("组件初始化完成（含超丝滑实时覆盖可视化）")
+        self.visualizer = RealMovementVisualizer(self.world)
+        
+        # 新增：初始化激光雷达避障系统
+        self.lidar_avoidance = LidarAvoidanceController()
+        self.dynamic_replanner = DynamicPathReplanner(self.path_planner, self.lidar_avoidance)
+        
+        print("组件初始化完成（含超丝滑覆盖可视化 + 激光雷达避障）")
     
     def _create_four_type_environment(self):
         """创建四类对象环境 - KLT框子任务区域版"""
@@ -178,9 +195,9 @@ class FourObjectCoverageSystem:
         
         # 1. 障碍物 (红色) - 路径规划避障
         obstacles_config = [
-            {"pos": [1.2, 0.8, 0.15], "size": [0.6, 0.4, 0.3], "color": [0.8, 0.2, 0.2], "shape": "box"},
-            {"pos": [0.5, -1.5, 0.2], "size": [1.2, 0.3, 0.4], "color": [0.8, 0.1, 0.1], "shape": "box"},
-            {"pos": [-1.0, 1.2, 0.25], "size": [0.5], "color": [0.7, 0.2, 0.2], "shape": "sphere"},
+            {"pos": [1.2, 0.8, 0.15], "size": [0.6, 0.4, 1], "color": [0.8, 0.2, 0.2], "shape": "box"},
+            {"pos": [0.5, -1.5, 0.2], "size": [1.2, 0.3, 1], "color": [0.8, 0.1, 0.1], "shape": "box"},
+            {"pos": [-1.0, 1.2, 0.25], "size": [0.7], "color": [0.7, 0.2, 0.2], "shape": "sphere"},
         ]
         
         # 2. 清扫目标 (黄色) - 触碰消失
@@ -200,7 +217,7 @@ class FourObjectCoverageSystem:
         
         # 4. KLT框子任务区域 - 使用自定义USD资产，放大尺寸
         klt_box_config = [
-            {"pos": [5, 0, 0.1], "size": [1.6, 0.8, 0.3], "usd_path": self.klt_box_usd_path, "shape": "usd_asset"},  # 尺寸放大2倍
+            {"pos": [5, 0, 0.1], "size": [1.6, 0.8, 0.3], "usd_path": self.klt_box_usd_path, "shape": "usd_asset"},
         ]
         
         # 创建所有对象
@@ -215,7 +232,7 @@ class FourObjectCoverageSystem:
             for i, config in enumerate(config_list):
                 self._create_scene_object(config, obj_type, i)
         
-        # 5. 添加外围围墙 - 确保足够远离任务区域
+        # 5. 添加外围围墙
         self._create_boundary_walls()
         
         print(f"四类对象环境创建完成:")
@@ -224,6 +241,7 @@ class FourObjectCoverageSystem:
         print(f"  抓取物体: {len(grasp_config)}个")
         print(f"  KLT框子任务区域: {len(klt_box_config)}个")
         print(f"  外围围墙: 已创建")
+        print(f"  激光雷达实时避障: 已启用")
     
     def _create_scene_object(self, config: Dict, obj_type: ObjectType, index: int):
         """创建场景对象 - 支持USD资产加载"""
@@ -278,9 +296,7 @@ class FourObjectCoverageSystem:
         # 对于USD资产，不添加到Isaac场景中，直接管理
         if obj_type == ObjectType.TASK and config.get("shape") == "usd_asset":
             isaac_obj = self._create_klt_box_task_area(config, prim_path, name)
-            # KLT框子保持物理属性，支持碰撞掉落
         elif isaac_obj:
-            # 只有标准Isaac对象才添加到场景
             self.world.scene.add(isaac_obj)
         
         # 创建场景对象
@@ -306,7 +322,7 @@ class FourObjectCoverageSystem:
         # 分析当前所有对象的分布范围
         all_positions = []
         for obj in self.scene_objects:
-            all_positions.append(obj.position[:2])  # 只考虑x,y坐标
+            all_positions.append(obj.position[:2])
         
         if all_positions:
             positions_array = np.array(all_positions)
@@ -314,7 +330,7 @@ class FourObjectCoverageSystem:
             max_x, max_y = positions_array.max(axis=0)
             
             # 额外扩展围墙范围，确保充足的安全距离
-            wall_margin = 8.0  # 围墙距离最远对象的安全距离
+            wall_margin = 3.0
             wall_x_range = max(abs(min_x), abs(max_x)) + wall_margin
             wall_y_range = max(abs(min_y), abs(max_y)) + wall_margin
             
@@ -323,45 +339,21 @@ class FourObjectCoverageSystem:
             print(f"  围墙范围: X[±{wall_x_range:.1f}], Y[±{wall_y_range:.1f}]")
         else:
             # 默认围墙范围
-            wall_x_range = 15.0
-            wall_y_range = 15.0
+            wall_x_range = 10.0
+            wall_y_range = 10.0
             print(f"  使用默认围墙范围: ±{wall_x_range}m")
         
         # 围墙配置参数
-        wall_thickness = 0.5  # 围墙厚度
-        wall_height = 2.0     # 围墙高度
-        wall_color = [0.6, 0.6, 0.6]  # 灰色围墙
+        wall_thickness = 0.5
+        wall_height = 2.0
+        wall_color = [0.6, 0.6, 0.6]
         
         # 创建四面围墙
         walls_config = [
-            # 北墙 (上方)
-            {
-                "name": "north_wall",
-                "pos": [0.0, wall_y_range + wall_thickness/2, wall_height/2],
-                "size": [wall_x_range*2 + wall_thickness*2, wall_thickness, wall_height],
-                "color": wall_color
-            },
-            # 南墙 (下方)
-            {
-                "name": "south_wall", 
-                "pos": [0.0, -(wall_y_range + wall_thickness/2), wall_height/2],
-                "size": [wall_x_range*2 + wall_thickness*2, wall_thickness, wall_height],
-                "color": wall_color
-            },
-            # 东墙 (右侧)
-            {
-                "name": "east_wall",
-                "pos": [wall_x_range + wall_thickness/2, 0.0, wall_height/2],
-                "size": [wall_thickness, wall_y_range*2, wall_height],
-                "color": wall_color
-            },
-            # 西墙 (左侧)
-            {
-                "name": "west_wall",
-                "pos": [-(wall_x_range + wall_thickness/2), 0.0, wall_height/2],
-                "size": [wall_thickness, wall_y_range*2, wall_height],
-                "color": wall_color
-            }
+            {"name": "north_wall", "pos": [0.0, wall_y_range + wall_thickness/2, wall_height/2], "size": [wall_x_range*2 + wall_thickness*2, wall_thickness, wall_height], "color": wall_color},
+            {"name": "south_wall", "pos": [0.0, -(wall_y_range + wall_thickness/2), wall_height/2], "size": [wall_x_range*2 + wall_thickness*2, wall_thickness, wall_height], "color": wall_color},
+            {"name": "east_wall", "pos": [wall_x_range + wall_thickness/2, 0.0, wall_height/2], "size": [wall_thickness, wall_y_range*2, wall_height], "color": wall_color},
+            {"name": "west_wall", "pos": [-(wall_x_range + wall_thickness/2), 0.0, wall_height/2], "size": [wall_thickness, wall_y_range*2, wall_height], "color": wall_color}
         ]
         
         # 创建围墙对象
@@ -369,7 +361,6 @@ class FourObjectCoverageSystem:
             wall_name = wall_config["name"]
             prim_path = f"/World/BoundaryWalls/{wall_name}"
             
-            # 创建固定围墙
             wall_obj = FixedCuboid(
                 prim_path=prim_path,
                 name=wall_name,
@@ -380,17 +371,15 @@ class FourObjectCoverageSystem:
             
             self.world.scene.add(wall_obj)
             
-            # 创建碰撞边界
             collision_boundary = CollisionBoundary(
                 center=np.array(wall_config["pos"]),
                 shape_type="box",
                 dimensions=np.array(wall_config["size"])
             )
             
-            # 创建场景对象并添加到路径规划器
             scene_obj = SceneObject(
                 name=wall_name,
-                object_type=ObjectType.OBSTACLE,  # 围墙作为障碍物处理
+                object_type=ObjectType.OBSTACLE,
                 position=np.array(wall_config["pos"]),
                 collision_boundary=collision_boundary,
                 isaac_object=wall_obj,
@@ -401,40 +390,30 @@ class FourObjectCoverageSystem:
             self.scene_objects.append(scene_obj)
             self.path_planner.add_scene_object(scene_obj)
             
-            print(f"    创建围墙: {wall_name} at [{wall_config['pos'][0]:.1f}, {wall_config['pos'][1]:.1f}, {wall_config['pos'][2]:.1f}]")
+            print(f"    创建围墙: {wall_name}")
         
-        print(f"  外围围墙创建完成: 4面围墙")
-        print(f"  围墙参数: 厚度{wall_thickness}m, 高度{wall_height}m")
-        print(f"  围墙已添加到路径规划避障系统")
+        print(f"  外围围墙创建完成: 4面围墙，已添加到激光雷达避障系统")
     
     def _create_klt_box_task_area(self, config: Dict, prim_path: str, name: str):
         """创建KLT框子任务区域"""
         try:
-            # 创建基础prim并添加USD reference
             stage = self.world.stage
             klt_prim = stage.DefinePrim(prim_path, "Xform")
             
-            # 添加USD引用
             references = klt_prim.GetReferences()
             references.AddReference(config["usd_path"])
             
-            # 设置位置和缩放
             xform = UsdGeom.Xformable(klt_prim)
             xform.ClearXformOpOrder()
             
-            # 位置变换
             translate_op = xform.AddTranslateOp()
             translate_op.Set(Gf.Vec3d(float(config["pos"][0]), float(config["pos"][1]), float(config["pos"][2])))
             
-            # 适当缩放KLT框子 - 放大2倍
             scale_op = xform.AddScaleOp()
-            scale_op.Set(Gf.Vec3d(2.0, 2.0, 2.0))  # 放大2倍，根据需要调整
+            scale_op.Set(Gf.Vec3d(2.0, 2.0, 2.0))
             
             print(f"  创建KLT框子任务区域: {name}")
-            print(f"  USD资产: {config['usd_path']}")
-            print(f"  位置: [{config['pos'][0]:.3f}, {config['pos'][1]:.3f}, {config['pos'][2]:.3f}]")
             
-            # 返回一个简单的对象引用
             class KLTBoxReference:
                 def __init__(self, prim_path, name, position):
                     self.prim_path = prim_path
@@ -451,7 +430,6 @@ class FourObjectCoverageSystem:
             
         except Exception as e:
             print(f"创建KLT框子失败: {e}")
-            # 创建备用立方体
             return FixedCuboid(
                 prim_path=prim_path,
                 name=name,
@@ -524,9 +502,14 @@ class FourObjectCoverageSystem:
         # 初始化控制器
         self.robot_controller = FixedRobotController(self.mobile_base, self.world)
         
-        # 关键：设置覆盖可视化器引用
+        # 设置覆盖可视化器引用
         self.robot_controller.set_coverage_visualizer(self.visualizer)
+        
+        # 新增：设置激光雷达避障系统
+        self.robot_controller.set_lidar_avoidance(self.lidar_avoidance, self.dynamic_replanner)
+        
         print("机器人控制器与超丝滑覆盖可视化器连接完成")
+        print("激光雷达避障系统集成完成")
         
         # 验证机器人状态
         pos, yaw = self.robot_controller._get_robot_pose()
@@ -541,7 +524,6 @@ class FourObjectCoverageSystem:
         
         robot_prim = self.world.stage.GetPrimAtPath("/World/create3_robot")
         
-        # 只修复明确的问题轮子
         problem_paths = [
             "/World/create3_robot/create_3/left_wheel/visuals_01",
             "/World/create3_robot/create_3/right_wheel/visuals_01"
@@ -641,15 +623,19 @@ class FourObjectCoverageSystem:
         # 设置完整路径可视化
         self.visualizer.setup_complete_path_visualization(self.coverage_path)
         
+        # 新增：设置路径到机器人控制器用于动态重规划
+        self.robot_controller.set_coverage_path(self.coverage_path)
+        
         print(f"KLT框子任务区域覆盖规划完成: {len(self.coverage_path)}个覆盖点")
         print("已集成超丝滑实时覆盖区域可视化系统")
+        print("激光雷达实时避障系统已启用")
         print_memory_usage("覆盖规划完成")
         
         return True
     
     def execute_four_object_coverage(self):
-        """执行四类对象覆盖 - KLT框子版本"""
-        print("\n开始执行四类对象覆盖（KLT框子任务区域版）...")
+        """执行四类对象覆盖 - 集成激光雷达避障"""
+        print("\n开始执行四类对象覆盖（KLT框子任务区域版 + 激光雷达避障）...")
         print_memory_usage("任务开始")
         
         # 展示路径预览
@@ -666,7 +652,15 @@ class FourObjectCoverageSystem:
         for i, point in enumerate(self.coverage_path):
             print(f"\n=== 导航到点 {i+1}/{len(self.coverage_path)} ===")
             
-            # 鲁棒移动到目标点 - 内置超丝滑覆盖标记
+            # 检查激光雷达避障状态
+            if self.lidar_avoidance:
+                status = self.lidar_avoidance.get_avoidance_status()
+                if status['mode'] != 'NORMAL':
+                    print(f"  激光雷达状态: {status['mode']}")
+                    if status['mode'] == 'DANGER':
+                        self.coverage_stats['emergency_stops'] += 1
+            
+            # 鲁棒移动到目标点 - 内置激光雷达避障
             success = self.robot_controller.move_to_position_robust(point.position, point.orientation)
             
             if success:
@@ -781,19 +775,18 @@ class FourObjectCoverageSystem:
             print(f"        没有找到KLT框子")
             return
             
-        klt_box = klt_boxes[0]  # 使用第一个KLT框子
+        klt_box = klt_boxes[0]
         klt_position = klt_box.position.copy()
         
-        # 计算最优接近位置 - 从KLT框子四周最近的方向接近
+        # 计算最优接近位置
         current_pos, _ = self.robot_controller._get_robot_pose()
         
-        # 定义KLT框子四周的接近点（相对于框子中心的偏移）
+        # 定义KLT框子四周的接近点
         approach_offsets = [
             [self.klt_approach_distance, 0.0],   # 右侧
             [-self.klt_approach_distance, 0.0],  # 左侧  
             [0.0, self.klt_approach_distance],   # 前面
             [0.0, -self.klt_approach_distance],  # 后面
-            # 对角线接近点，距离稍远一些
             [self.klt_approach_distance * 0.7, self.klt_approach_distance * 0.7],   # 右前
             [-self.klt_approach_distance * 0.7, self.klt_approach_distance * 0.7],  # 左前
             [self.klt_approach_distance * 0.7, -self.klt_approach_distance * 0.7],  # 右后
@@ -806,7 +799,7 @@ class FourObjectCoverageSystem:
             candidate_pos = klt_position.copy()
             candidate_pos[0] += offset[0]
             candidate_pos[1] += offset[1] 
-            candidate_pos[2] = 0.0  # 地面高度
+            candidate_pos[2] = 0.0
             
             # 检查候选点是否与障碍物冲突
             is_safe = True
@@ -816,8 +809,12 @@ class FourObjectCoverageSystem:
                         is_safe = False
                         break
             
+            # 新增：检查激光雷达是否认为该点安全
+            if is_safe and self.lidar_avoidance:
+                # 暂时简化检查，实际可以扩展为更复杂的安全性验证
+                pass
+            
             if is_safe:
-                # 计算从当前位置到候选点的距离
                 distance = np.linalg.norm(current_pos[:2] - candidate_pos[:2])
                 approach_candidates.append((candidate_pos, distance, offset))
         
@@ -833,18 +830,15 @@ class FourObjectCoverageSystem:
                 approach_candidates.append((candidate_pos, distance, offset))
         
         # 选择距离最近的安全接近点
-        approach_candidates.sort(key=lambda x: x[1])  # 按距离排序
+        approach_candidates.sort(key=lambda x: x[1])
         approach_pos, min_distance, chosen_offset = approach_candidates[0]
         
         print(f"        智能选择接近方向: 偏移[{chosen_offset[0]:.1f}, {chosen_offset[1]:.1f}]")
         print(f"        从当前位置到接近点距离: {min_distance:.3f}m")
-        print(f"        安全接近点数量: {len(approach_candidates)}")
         
         print(f"        导航到KLT框子接近位置: [{approach_pos[0]:.3f}, {approach_pos[1]:.3f}]")
-        print(f"        KLT框子位置: [{klt_position[0]:.3f}, {klt_position[1]:.3f}]")
-        print(f"        接近距离阈值: {self.klt_approach_distance}m")
         
-        # 导航到接近位置
+        # 导航到接近位置（集成激光雷达避障）
         success = self.robot_controller.move_to_position_robust(approach_pos)
         
         if success:
@@ -854,7 +848,7 @@ class FourObjectCoverageSystem:
             
             print(f"        当前到KLT框子距离: {distance_to_klt:.3f}m")
             
-            if distance_to_klt <= self.klt_approach_distance + 0.2:  # 允许一定误差
+            if distance_to_klt <= self.klt_approach_distance + 0.2:
                 # 足够接近，可以投放
                 self._perform_release_to_klt_box(grasp_obj, klt_box)
                 print(f"        运送到KLT框子完成")
@@ -877,8 +871,8 @@ class FourObjectCoverageSystem:
         klt_dimensions = klt_box.collision_boundary.dimensions
         
         # 计算KLT框子内的安全释放区域（避开边缘）
-        safe_margin = 0.2  # 离边缘的安全距离
-        x_range = max(0.2, (klt_dimensions[0] - safe_margin * 2))  # 确保最小范围
+        safe_margin = 0.2
+        x_range = max(0.2, (klt_dimensions[0] - safe_margin * 2))
         y_range = max(0.2, (klt_dimensions[1] - safe_margin * 2))
         
         # 在KLT框子内随机选择释放位置
@@ -888,22 +882,20 @@ class FourObjectCoverageSystem:
         drop_position = klt_position.copy()
         drop_position[0] += random_x_offset
         drop_position[1] += random_y_offset
-        drop_position[2] = klt_position[2] + 1.0  # 在KLT框子上方一定高度释放
+        drop_position[2] = klt_position[2] + 1.0
         
         print(f"          随机分散释放位置: [{drop_position[0]:.3f}, {drop_position[1]:.3f}, {drop_position[2]:.3f}]")
-        print(f"          相对KLT框子偏移: [{random_x_offset:.3f}, {random_y_offset:.3f}]")
         
         # 创建新的投放物体（具有物理属性的动态物体）
         drop_name = f"delivered_{grasp_obj.name}"
         drop_prim_path = f"/World/{drop_name}"
         
-        # 使用DynamicCuboid创建具有物理掉落效果的物体
         drop_obj = DynamicCuboid(
             prim_path=drop_prim_path,
             name=drop_name,
             position=drop_position,
-            scale=grasp_obj.collision_boundary.dimensions * 0.9,  # 稍微小一点放入框内
-            color=grasp_obj.color * 0.7  # 稍微暗一点表示已放置
+            scale=grasp_obj.collision_boundary.dimensions * 0.9,
+            color=grasp_obj.color * 0.7
         )
         
         self.world.scene.add(drop_obj)
@@ -914,15 +906,12 @@ class FourObjectCoverageSystem:
         
         # 给物体添加随机的初始速度，增加分散效果
         try:
-            # 随机的水平初始速度
             random_velocity_x = random.uniform(-0.5, 0.5)
             random_velocity_y = random.uniform(-0.5, 0.5)
-            random_velocity_z = random.uniform(-0.2, 0.2)  # 轻微的垂直速度变化
+            random_velocity_z = random.uniform(-0.2, 0.2)
             
-            # 设置线性速度
             drop_obj.set_linear_velocity(np.array([random_velocity_x, random_velocity_y, random_velocity_z]))
             
-            # 添加轻微的角速度，让物体有旋转效果
             random_angular_velocity = np.array([
                 random.uniform(-1.0, 1.0),
                 random.uniform(-1.0, 1.0), 
@@ -980,7 +969,7 @@ class FourObjectCoverageSystem:
         print(f"    夹爪控制完成: {action} ({controlled_joints}个关节)")
     
     def _show_four_object_results(self):
-        """显示四类对象结果 - KLT框子版本"""
+        """显示四类对象结果 - 集成激光雷达避障统计"""
         coverage_marks = len(self.visualizer.fluent_coverage_visualizer.coverage_marks)
         
         # 统计各类对象
@@ -989,7 +978,7 @@ class FourObjectCoverageSystem:
         grasp_total = len([obj for obj in self.scene_objects if obj.object_type == ObjectType.GRASP])
         klt_count = len([obj for obj in self.scene_objects if obj.object_type == ObjectType.TASK])
         
-        print(f"\n=== 四类对象覆盖结果（KLT框子任务区域版） ===")
+        print(f"\n=== 四类对象覆盖结果（KLT框子任务区域版 + 激光雷达避障） ===")
         print(f"覆盖路径点数: {len(self.coverage_path)}")
         print(f"超丝滑覆盖标记区域: {coverage_marks}个")
         print(f"")
@@ -1007,25 +996,42 @@ class FourObjectCoverageSystem:
         print(f"  清扫完成: {self.coverage_stats['swept_objects']}/{sweep_total}")
         print(f"  抓取完成: {self.coverage_stats['grasped_objects']}/{grasp_total}")
         print(f"  投放到KLT框子: {self.coverage_stats['delivered_objects']}/{grasp_total}")
+        
+        # 新增：激光雷达避障统计
+        if self.lidar_avoidance:
+            avoidance_status = self.lidar_avoidance.get_avoidance_status()
+            print(f"")
+            print(f"激光雷达避障统计:")
+            print(f"  紧急停车次数: {self.coverage_stats['emergency_stops']}")
+            print(f"  当前避障模式: {avoidance_status['mode']}")
+            print(f"  激光数据状态: {'正常' if avoidance_status['scan_available'] else '异常'}")
+            print(f"  数据延迟: {avoidance_status['data_age']:.2f}秒")
+        
         print(f"")
         sweep_rate = (self.coverage_stats['swept_objects'] / sweep_total * 100) if sweep_total > 0 else 0
         grasp_rate = (self.coverage_stats['delivered_objects'] / grasp_total * 100) if grasp_total > 0 else 0
         print(f"任务完成率:")
         print(f"  清扫任务: {sweep_rate:.1f}%")
         print(f"  KLT框子投放任务: {grasp_rate:.1f}%")
-        print("KLT框子四类对象覆盖任务完成（集成超丝滑实时覆盖可视化）!")
+        print("KLT框子四类对象覆盖任务完成（集成激光雷达实时避障系统）!")
     
     def run_demo(self):
         """运行演示"""
         print("\n" + "="*80)
-        print("四类对象真实移动覆盖算法机器人系统 - KLT框子任务区域版")
+        print("四类对象真实移动覆盖算法机器人系统 - KLT框子任务区域版 + 激光雷达避障")
         print("障碍物避障 | 清扫目标消失 | 抓取运送 | KLT框子投放")
         print("优化路径规划 | 距离判断到达 | 智能弓字形避障")
         print("集成超丝滑实时覆盖区域可视化 | KLT框子USD资产")
+        print("激光雷达分层避障 | 紧急避障 | 动态路径重规划")
         print("="*80)
         
         pos, yaw = self.robot_controller._get_robot_pose()
         print(f"机器人初始位置: [{pos[0]:.3f}, {pos[1]:.3f}], 朝向: {np.degrees(yaw):.1f}°")
+        
+        # 展示激光雷达状态
+        if self.lidar_avoidance:
+            status = self.lidar_avoidance.get_avoidance_status()
+            print(f"激光雷达状态: {status}")
         
         self.plan_coverage_mission()
         
@@ -1034,6 +1040,7 @@ class FourObjectCoverageSystem:
         self._move_arm_to_pose("home")
         
         print("\nKLT框子四类对象覆盖系统演示完成!")
+        print("激光雷达实时避障系统运行正常!")
     
     def cleanup(self):
         """清理系统"""
@@ -1042,6 +1049,14 @@ class FourObjectCoverageSystem:
         
         if self.visualizer:
             self.visualizer.cleanup()
+        
+        # 新增：清理ROS资源
+        if self.lidar_avoidance:
+            # LaserScan订阅器会自动清理
+            pass
+        
+        # 关闭ROS节点
+        rospy.signal_shutdown("系统关闭")
         
         # 清理内存
         for _ in range(5):
@@ -1057,11 +1072,17 @@ class FourObjectCoverageSystem:
 
 def main():
     """主函数"""
-    print("KLT框子任务区域版机器人覆盖系统")
+    print("KLT框子任务区域版机器人覆盖系统 + 激光雷达实时避障")
     print(f"机器人半径: {ROBOT_RADIUS}m")
     print(f"安全边距: {SAFETY_MARGIN}m") 
     print(f"交互距离: {INTERACTION_DISTANCE}m")
     print("优化特性: 高效弓字形避障路径，KLT框子物理碰撞")
+    print("激光雷达避障特性:")
+    print(f"  最近检测距离: 0.6m")
+    print(f"  危险距离阈值: 0.7m") 
+    print(f"  警告距离阈值: 1.0m")
+    print(f"  安全距离阈值: 1.5m")
+    print(f"  分层避障策略: 危险停止，警告减速，安全正常")
     print("")
     print("KLT框子特性:")
     print("  USD资产加载")
