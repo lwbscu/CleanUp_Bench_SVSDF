@@ -18,9 +18,9 @@ PATH_TOLERANCE = 0.2           # 路径容差 (m)
 POSITION_TOLERANCE = 0.2       # 位置容差 (m)
 ANGLE_TOLERANCE = 0.2          # 角度容差 (rad)
 MAX_NAVIGATION_STEPS = 10000   # 最大导航步数
-MAX_GHOST_ROBOTS = 15          # 最大幽灵机器人数量
+MAX_GHOST_ROBOTS = 0          # 最大幽灵机器人数量
 SAFETY_MARGIN = 0.2            # 安全边距 (m)
-INTERACTION_DISTANCE = 0.6     # 交互距离 (m)
+INTERACTION_DISTANCE = 1     # 交互距离 (m)
 
 # 超丝滑可视化参数 - 大幅提升流畅度
 FINE_GRID_SIZE = 0.03          # 从0.1减小到0.03，标记更密集
