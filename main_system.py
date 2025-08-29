@@ -122,7 +122,7 @@ class FourObjectCoverageSystem:
         
         # KLT框子配置
         self.klt_box_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/NVIDIA/Assets/ArchVis/Lobby/My_asset/T/small_KLT.usd"
-        self.klt_approach_distance = 1.0 # 优化：机器人距离释放task区域的释放距离，从1.2m调整为1.0m
+        self.klt_approach_distance = 0.8 # 优化：减小距离，确保释放在框子内
         
         # 真实Franka机械臂抓取配置 - 使用test.py验证参数
         self.arm_poses = {
@@ -140,7 +140,7 @@ class FourObjectCoverageSystem:
         
         # 夹爪位置 - test.py验证参数
         self.gripper_open_pos = 0.05     # 张开位置
-        self.gripper_close_pos = 0.026   # 闭合位置
+        self.gripper_close_pos = 0.025   # 闭合位置
         
         # 优化：角度和距离控制参数
         self.angle_tolerance = 0.05      # 角度容差，从原来的0.2减小到0.05，更精确
@@ -441,12 +441,21 @@ class FourObjectCoverageSystem:
             xform.ClearXformOpOrder()
             
             translate_op = xform.AddTranslateOp()
-            translate_op.Set(Gf.Vec3d(float(config["pos"][0]), float(config["pos"][1]), float(config["pos"][2])))
+            translate_op.Set(Gf.Vec3d(float(config["pos"][0]), float(config["pos"][1]), 0.0))  # 强制Z=0，贴地面
             
             scale_op = xform.AddScaleOp()
             scale_op.Set(Gf.Vec3d(2.0, 2.0, 2.0))
             
-            print(f"  创建KLT框子任务区域: {name}")
+            # 添加物理属性 - 修复浮空问题，启用动态重力
+            if not klt_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                rigid_body_api = UsdPhysics.RigidBodyAPI.Apply(klt_prim)
+                rigid_body_api.CreateRigidBodyEnabledAttr().Set(False)  # 改回静态，防止浮空
+            
+            if not klt_prim.HasAPI(UsdPhysics.CollisionAPI):
+                collision_api = UsdPhysics.CollisionAPI.Apply(klt_prim)
+                collision_api.CreateCollisionEnabledAttr().Set(True)
+            
+            print(f"  创建KLT框子任务区域: {name} (强制贴地面)")
             
             class KLTBoxReference:
                 def __init__(self, prim_path, name, position):
@@ -969,8 +978,40 @@ class FourObjectCoverageSystem:
         
         print(f"    夹爪动作完成: {action} -> {gripper_pos}m (稳定{self.gripper_stabilization_time}s)")
     
+    def _ensure_gripper_closed_tight(self):
+        """确保夹爪紧密关闭 - 用于运输过程中防止松动"""
+        print(f"          检查夹爪状态，确保紧密关闭...")
+        
+        gripper_names = ["panda_finger_joint1", "panda_finger_joint2"]
+        articulation_controller = self.mobile_base.get_articulation_controller()
+        
+        # 获取当前关节位置
+        current_joint_positions = self.mobile_base.get_joint_positions()
+        num_dofs = len(self.mobile_base.dof_names)
+        joint_positions = torch.zeros(num_dofs, dtype=torch.float32)
+        
+        # 保持当前所有关节位置
+        for i in range(num_dofs):
+            joint_positions[i] = float(current_joint_positions[i])
+        
+        # 强制设置夹爪为关闭位置
+        for joint_name in gripper_names:
+            if joint_name in self.mobile_base.dof_names:
+                idx = self.mobile_base.dof_names.index(joint_name)
+                joint_positions[idx] = self.gripper_close_pos
+        
+        # 应用关节控制
+        action_obj = ArticulationAction(joint_positions=joint_positions)
+        articulation_controller.apply_action(action_obj)
+        
+        # 短暂稳定
+        for _ in range(30):  # 0.5秒稳定时间
+            self.world.step(render=True)
+        
+        print(f"          夹爪状态检查完成，确保紧密关闭到 {self.gripper_close_pos}m")
+    
     def _deliver_to_klt_box_with_real_arm(self, grasp_obj: SceneObject):
-        """运送到KLT框子 - 真实机械臂版本"""
+        """运送到KLT框子 - 真实机械臂版本，加强夹爪稳定性"""
         print(f"        运送到KLT框子...")
         
         # 找到KLT框子任务区域
@@ -981,6 +1022,10 @@ class FourObjectCoverageSystem:
             
         klt_box = klt_boxes[0]
         klt_position = klt_box.position.copy()
+        
+        # **运输前，确保夹爪紧密关闭**
+        print(f"        运输前检查，确保夹爪紧密关闭...")
+        self._ensure_gripper_closed_tight()
         
         # 计算最优接近位置 - 优化：使用更近的距离
         current_pos, _ = self.robot_controller._get_robot_pose()
@@ -1035,8 +1080,12 @@ class FourObjectCoverageSystem:
         print(f"        智能选择接近方向: 偏移[{chosen_offset[0]:.1f}, {chosen_offset[1]:.1f}]")
         print(f"        导航到KLT框子接近位置: [{approach_pos[0]:.3f}, {approach_pos[1]:.3f}]")
         
-        # 导航到接近位置（集成激光雷达避障）
+        # **导航到接近位置（集成激光雷达避障）**
         success = self.robot_controller.move_to_position_robust(approach_pos)
+        
+        # **导航过程中检查夹爪状态**
+        print(f"        导航完成，检查夹爪状态...")
+        self._ensure_gripper_closed_tight()
         
         if success:
             # 检查是否足够接近KLT框子
@@ -1047,6 +1096,10 @@ class FourObjectCoverageSystem:
             
             # 优化：使用更宽松的距离检查，因为接近距离已经减小
             if distance_to_klt <= self.klt_approach_distance + 0.3:
+                # **到达后再次确保夹爪关闭**
+                print(f"        到达KLT框子，最后检查夹爪状态...")
+                self._ensure_gripper_closed_tight()
+                
                 # 足够接近，可以投放
                 self._perform_release_with_real_arm_and_physics(grasp_obj, klt_box)
                 print(f"        运送到KLT框子完成")
@@ -1056,62 +1109,19 @@ class FourObjectCoverageSystem:
             print(f"        导航到KLT框子失败")
     
     def _perform_release_with_real_arm_and_physics(self, grasp_obj: SceneObject, klt_box: SceneObject):
-        """执行真实机械臂释放到KLT框子 - 保持物体物理状态"""
+        """执行真实机械臂释放到KLT框子 - 物体自然掉落"""
         print(f"          执行真实Franka机械臂释放...")
         
         # 机械臂移动到释放姿态并张开夹爪
         self._move_arm_to_pose("carry")  # 保持抬起状态
-        self._control_gripper_with_test_params("open")    # 张开夹爪释放物体
-        
-        # 在KLT框子内随机分散位置释放物体
-        klt_position = klt_box.position.copy()
-        klt_dimensions = klt_box.collision_boundary.dimensions
-        
-        # 计算KLT框子内的安全释放区域（避开边缘）
-        safe_margin = 0.2
-        x_range = max(0.2, (klt_dimensions[0] - safe_margin * 2))
-        y_range = max(0.2, (klt_dimensions[1] - safe_margin * 2))
-        
-        # 在KLT框子内随机选择释放位置
-        random_x_offset = random.uniform(-x_range/2, x_range/2)
-        random_y_offset = random.uniform(-y_range/2, y_range/2)
-        
-        drop_position = klt_position.copy()
-        drop_position[0] += random_x_offset
-        drop_position[1] += random_y_offset
-        drop_position[2] = klt_position[2] + 0.5  # 在框子上方释放
-        
-        print(f"          物体释放位置: [{drop_position[0]:.3f}, {drop_position[1]:.3f}, {drop_position[2]:.3f}]")
-        
-        # 直接移动原物体到释放位置，保持其动态物理属性
-        grasp_obj.isaac_object.set_world_pose(drop_position, np.array([0, 0, 0, 1]))
-        
-        # 给物体添加随机的初始速度，增加分散效果
-        try:
-            random_velocity_x = random.uniform(-0.3, 0.3)
-            random_velocity_y = random.uniform(-0.3, 0.3)
-            random_velocity_z = random.uniform(-0.1, 0.1)
-            
-            grasp_obj.isaac_object.set_linear_velocity(np.array([random_velocity_x, random_velocity_y, random_velocity_z]))
-            
-            random_angular_velocity = np.array([
-                random.uniform(-0.5, 0.5),
-                random.uniform(-0.5, 0.5), 
-                random.uniform(-0.5, 0.5)
-            ])
-            grasp_obj.isaac_object.set_angular_velocity(random_angular_velocity)
-            
-            print(f"          添加随机初始速度: 线性[{random_velocity_x:.2f}, {random_velocity_y:.2f}, {random_velocity_z:.2f}]")
-            
-        except Exception as e:
-            print(f"          设置初始速度失败: {e}")
+        self._control_gripper_with_test_params("open")    # 张开夹爪，物体自然掉落
         
         # 观察物体掉落过程
         for _ in range(30):
             self.world.step(render=True)
             time.sleep(0.02)
         
-        print(f"          物体在KLT框子内物理掉落完成")
+        print(f"          物体自然掉落完成")
         
         # 机械臂回到home姿态
         self._move_arm_to_pose("home")
