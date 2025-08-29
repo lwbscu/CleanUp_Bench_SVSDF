@@ -48,7 +48,7 @@ class LidarAvoidanceController:
         
         # 距离输出控制
         self.last_distance_output_time = rospy.Time.now()
-        self.distance_output_interval = 10.0  # 每隔1秒输出一次距离信息
+        self.distance_output_interval = 10.0  # 每隔10秒输出一次距离信息
         
         # ROS订阅器 - 修改为订阅PointCloud2格式
         self.laser_sub = rospy.Subscriber('/robot_lidar_pointcloud', PointCloud2, 

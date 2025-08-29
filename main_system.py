@@ -5,6 +5,7 @@
 集成激光雷达实时避障功能
 新增：真实Franka机械臂抓取功能 - 使用test.py验证参数
 优化：精确角度控制和释放距离调整
+优化抓取策略：先变姿态，再移动，再抓取
 """
 
 import psutil
@@ -28,7 +29,7 @@ print("启动KLT框架任务区域版四类对象覆盖算法机器人系统..."
 print(f"对象类型:")
 print(f"  1. 障碍物(红色) - 路径规划避障")
 print(f"  2. 清扫目标(黄色) - 触碰消失") 
-print(f"  3. 抓取物体(绿色) - 运送到KLT框子")
+print(f"  3. 抓取物体(绿色) - 运输到KLT框子")
 print(f"  4. KLT框子任务区域 - 物体投放区域 (具有物理碰撞)")
 print(f"  5. 激光雷达实时避障 - 分层避障策略")
 print(f"  6. 真实Franka机械臂抓取 - 精确关节控制")
@@ -228,8 +229,8 @@ class FourObjectCoverageSystem:
         
         # 1. 障碍物 (红色) - 路径规划避障
         obstacles_config = [
-            {"pos": [1.2, 0.8, 0.15], "size": [0.6, 0.4, 1.4], "color": [0.8, 0.2, 0.2], "shape": "box"},
-            {"pos": [0.5, -1.5, 0.2], "size": [1.2, 0.3, 1.4], "color": [0.8, 0.1, 0.1], "shape": "box"},
+            {"pos": [1.2, 0.8, 0.15], "size": [0.6, 0.4, 1.8], "color": [0.8, 0.2, 0.2], "shape": "box"},
+            {"pos": [0.5, -1.5, 0.2], "size": [1.2, 0.3, 1.8], "color": [0.8, 0.1, 0.1], "shape": "box"},
             {"pos": [-1.0, 1.2, 0.25], "size": [0.7], "color": [0.7, 0.2, 0.2], "shape": "sphere"},
         ]
         
@@ -241,7 +242,7 @@ class FourObjectCoverageSystem:
             {"pos": [2.0, 0.5, 0.05], "size": [0.1], "color": [0.8, 0.8, 0.2], "shape": "sphere"},
         ]
         
-        # 3. 抓取物体 (绿色) - 运送到KLT框子 - 使用test.py验证的尺寸
+        # 3. 抓取物体 (绿色) - 运输到KLT框子 - 使用test.py验证的尺寸
         grasp_config = [
             {"pos": [1.5, 0.0, 0.08], "size": [0.05, 0.05, 0.05], "color": [0.2, 0.8, 0.2], "shape": "box"},
             {"pos": [-2, -5, 0.08], "size": [0.05, 0.05, 0.05], "color": [0.1, 0.9, 0.1], "shape": "box"},
@@ -702,6 +703,9 @@ class FourObjectCoverageSystem:
                     print(f"  激光雷达状态: {status['mode']}")
                     if status['mode'] == 'DANGER':
                         self.coverage_stats['emergency_stops'] += 1
+                        # 简化避障：直接控制底盘运动
+                        self._simple_obstacle_avoidance()
+                        continue
             
             # 鲁棒移动到目标点 - 内置激光雷达避障
             success = self.robot_controller.move_to_position_robust(point.position, point.orientation)
@@ -728,171 +732,48 @@ class FourObjectCoverageSystem:
         print(f"成功到达点数: {successful_points}/{len(self.coverage_path)}")
         self._show_four_object_results()
     
-    def _check_four_object_interactions(self, robot_pos: np.ndarray):
-        """检查四类对象交互 - 集成真实抓取"""
-        for scene_obj in self.scene_objects:
-            if not scene_obj.is_active:
-                continue
-            
-            # 检查碰撞
-            if self.path_planner.check_collision_with_object(robot_pos, scene_obj):
-                self._handle_object_interaction(scene_obj, robot_pos)
-    
-    def _handle_object_interaction(self, scene_obj: SceneObject, robot_pos: np.ndarray):
-        """处理对象交互 - 集成真实抓取"""
-        print(f"    交互检测: {scene_obj.name} ({scene_obj.object_type.value})")
+    def _simple_obstacle_avoidance(self):
+        """简化障碍物避障 - 直接控制底盘运动"""
+        print("  执行简化激光雷达避障...")
         
-        if scene_obj.object_type == ObjectType.SWEEP:
-            self._handle_sweep_object(scene_obj)
-        elif scene_obj.object_type == ObjectType.GRASP:
-            self._handle_grasp_object_with_real_arm(scene_obj, robot_pos)
-    
-    def _handle_sweep_object(self, sweep_obj: SceneObject):
-        """处理清扫对象"""
-        print(f"      清扫目标消失: {sweep_obj.name}")
-        
-        # 隐藏对象
-        sweep_obj.isaac_object.set_visibility(False)
-        sweep_obj.isaac_object.set_world_pose(
-            np.array([100.0, 100.0, -5.0]), 
-            np.array([0, 0, 0, 1])
-        )
-        
-        # 标记为非活跃
-        sweep_obj.is_active = False
-        self.coverage_stats['swept_objects'] += 1
-        
-        print(f"      清扫完成，总清扫数: {self.coverage_stats['swept_objects']}")
-    
-    def _handle_grasp_object_with_real_arm(self, grasp_obj: SceneObject, robot_pos: np.ndarray):
-        """处理抓取对象 - 真实Franka机械臂抓取 - 使用test.py验证参数"""
-        print(f"      检测到抓取对象: {grasp_obj.name}")
-        
-        # 如果已经在运送其他物体，跳过
-        if self.carrying_object is not None:
-            print(f"      已在运送物体，跳过")
+        # 获取安全方向
+        safe_directions = self.lidar_avoidance.get_safe_directions()
+        if not safe_directions:
+            print("  没有安全方向，停止移动")
             return
         
-        # 检查是否在抓取触发距离内
-        distance = np.linalg.norm(robot_pos[:2] - grasp_obj.position[:2])
-        print(f"      当前距离抓取对象: {distance:.3f}m (触发阈值: {self.grasp_trigger_distance}m)")
-        
-        if distance > self.grasp_trigger_distance:
-            print(f"      距离超出触发范围，跳过抓取")
-            return
-        
-        print(f"      触发抓取任务! 距离: {distance:.3f}m")
-        
-        # 记录返回位置
-        self.return_position = robot_pos.copy()
-        
-        # 执行完整抓取序列 - 使用test.py验证的流程
-        self._execute_full_grasp_sequence_with_test_params(grasp_obj)
-        
-        # 运送到KLT框子
-        self._deliver_to_klt_box_with_real_arm(grasp_obj)
-        
-        # 返回继续覆盖
-        self._return_to_coverage()
-    
-    def _execute_full_grasp_sequence_with_test_params(self, grasp_obj: SceneObject):
-        """执行完整抓取序列 - 使用test.py验证参数和流程"""
-        print(f"        执行真实Franka机械臂抓取序列 (test.py验证参数)...")
-        
-        # 步骤1: 定位到抓取对象正前方 - 精确对准
-        self._position_for_grasp_precise(grasp_obj)
-        
-        # 步骤2: 机械臂执行抓取动作 - test.py流程
-        #print("        2.1 闭合夹爪抓取")
-        #self._control_gripper_with_test_params("close")
-
-        self._control_gripper_with_test_params("open")
-        print("        2.2 机械臂移动到抓取姿态")
-        self._move_arm_to_pose("grasp_approach")
-        self._control_gripper_with_test_params("close")
-        print("        2.3 抬起物体")
-        self._move_arm_to_pose("grasp_lift")
-        
-        # 标记为运送中 - 不消失物体，通过真实抓取移动
-        self.carrying_object = grasp_obj
-        grasp_obj.is_active = False
-        self.coverage_stats['grasped_objects'] += 1
-        
-        print(f"        Franka机械臂抓取完成 - 物体保持可见状态")
-    
-    def _position_for_grasp_precise(self, grasp_obj: SceneObject):
-        """精确定位到抓取对象 - 简化为直接朝向移动"""
-        print(f"          直接朝向抓取对象移动...")
-        
-        object_pos = grasp_obj.position
+        # 选择第一个安全方向并转向
+        target_direction = safe_directions[0]
         current_pos, current_yaw = self.robot_controller._get_robot_pose()
         
-        # 计算从当前位置到对象的方向
-        direction_to_object = object_pos[:2] - current_pos[:2]
-        distance_to_object = np.linalg.norm(direction_to_object)
-        
-        print(f"          对象位置: [{object_pos[0]:.3f}, {object_pos[1]:.3f}]")
-        print(f"          当前位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}]")
-        print(f"          当前距离: {distance_to_object:.3f}m")
-        
-        # 计算目标角度 - 面向抓取对象
-        target_yaw = np.arctan2(direction_to_object[1], direction_to_object[0])
-        print(f"          目标角度: {np.degrees(target_yaw):.1f}°")
-        
-        # 先精确角度调整
-        self._precise_angle_adjustment(target_yaw)
-        
-        # 计算停止位置 - 距离对象0.37米
-        if distance_to_object > self.grasp_approach_distance:
-            direction_norm = direction_to_object / distance_to_object
-            approach_pos = object_pos[:2] - direction_norm * self.grasp_approach_distance
-            approach_pos_3d = np.array([approach_pos[0], approach_pos[1], 0.0])
-            
-            print(f"          接近位置: [{approach_pos_3d[0]:.3f}, {approach_pos_3d[1]:.3f}]")
-            
-            # 移动到接近位置
-            success = self.robot_controller.move_to_position_robust(approach_pos_3d, target_yaw)
-        else:
-            print(f"          已在接近距离内，无需移动")
-            success = True
-        
-        print(f"          直接抓取定位完成")
-    
-    def _precise_angle_adjustment(self, target_yaw: float):
-        """精确角度调整 - 优化角度控制"""
-        print(f"            执行精确角度调整到: {np.degrees(target_yaw):.1f}°")
-        
-        max_angle_steps = 250
-        
-        for step in range(max_angle_steps):
-            current_pos, current_yaw = self.robot_controller._get_robot_pose()
-            
-            # 计算角度误差
-            angle_error = self._normalize_angle(target_yaw - current_yaw)
-            
-            # 优化：使用更小的角度容差
-            if abs(angle_error) < self.angle_tolerance:
-                print(f"            角度调整完成! 误差: {np.degrees(angle_error):.2f}°")
+        # 转向安全方向
+        for _ in range(30):
+            angle_error = self._normalize_angle(target_direction - current_yaw)
+            if abs(angle_error) < 0.1:
                 break
             
-            # 优化：使用更大的角速度增益和最大角速度
-            angular_vel = np.clip(self.angular_kp * angle_error, 
-                                -self.max_angular_vel, self.max_angular_vel)
-            
-            # 发送角度调整指令
+            angular_vel = np.clip(3.0 * angle_error, -1.5, 1.5)
             self._send_velocity_command(0.0, angular_vel)
             self.world.step(render=True)
+            current_pos, current_yaw = self.robot_controller._get_robot_pose()
             
-            if step % 50 == 0:
-                print(f"              角度调整中... 误差: {np.degrees(angle_error):.2f}°")
+            # 继续标记覆盖
+            if self.robot_controller.coverage_visualizer:
+                self.robot_controller.coverage_visualizer.fluent_coverage_visualizer.mark_coverage_realtime(current_pos)
         
-        # 停止旋转
+        # 前进一小段距离
+        for _ in range(20):
+            self._send_velocity_command(0.2, 0.0)
+            self.world.step(render=True)
+            current_pos, _ = self.robot_controller._get_robot_pose()
+            
+            # 继续标记覆盖
+            if self.robot_controller.coverage_visualizer:
+                self.robot_controller.coverage_visualizer.fluent_coverage_visualizer.mark_coverage_realtime(current_pos)
+        
+        # 停止
         self._send_velocity_command(0.0, 0.0)
-        
-        # 最终验证角度
-        final_pos, final_yaw = self.robot_controller._get_robot_pose()
-        final_angle_error = self._normalize_angle(target_yaw - final_yaw)
-        print(f"            最终角度误差: {np.degrees(final_angle_error):.2f}°")
+        print("  简化避障完成")
     
     def _send_velocity_command(self, linear_vel: float, angular_vel: float):
         """发送速度指令到轮子"""
@@ -931,6 +812,172 @@ class FourObjectCoverageSystem:
             angle += 2 * math.pi
         return angle
     
+    def _check_four_object_interactions(self, robot_pos: np.ndarray):
+        """检查四类对象交互 - 集成真实抓取"""
+        for scene_obj in self.scene_objects:
+            if not scene_obj.is_active:
+                continue
+            
+            # 检查碰撞
+            if self.path_planner.check_collision_with_object(robot_pos, scene_obj):
+                self._handle_object_interaction(scene_obj, robot_pos)
+    
+    def _handle_object_interaction(self, scene_obj: SceneObject, robot_pos: np.ndarray):
+        """处理对象交互 - 集成真实抓取"""
+        print(f"    交互检测: {scene_obj.name} ({scene_obj.object_type.value})")
+        
+        if scene_obj.object_type == ObjectType.SWEEP:
+            self._handle_sweep_object(scene_obj)
+        elif scene_obj.object_type == ObjectType.GRASP:
+            self._handle_grasp_object_optimized(scene_obj, robot_pos)
+    
+    def _handle_sweep_object(self, sweep_obj: SceneObject):
+        """处理清扫对象"""
+        print(f"      清扫目标消失: {sweep_obj.name}")
+        
+        # 隐藏对象
+        sweep_obj.isaac_object.set_visibility(False)
+        sweep_obj.isaac_object.set_world_pose(
+            np.array([100.0, 100.0, -5.0]), 
+            np.array([0, 0, 0, 1])
+        )
+        
+        # 标记为非活跃
+        sweep_obj.is_active = False
+        self.coverage_stats['swept_objects'] += 1
+        
+        print(f"      清扫完成，总清扫数: {self.coverage_stats['swept_objects']}")
+    
+    def _handle_grasp_object_optimized(self, grasp_obj: SceneObject, robot_pos: np.ndarray):
+        """优化的抓取处理 - 先变姿态，再移动，再抓取"""
+        print(f"      检测到抓取对象: {grasp_obj.name}")
+        
+        # 如果已经在运输其他物体，跳过
+        if self.carrying_object is not None:
+            print(f"      已在运输物体，跳过")
+            return
+        
+        # 检查是否在抓取触发距离内
+        distance = np.linalg.norm(robot_pos[:2] - grasp_obj.position[:2])
+        print(f"      当前距离抓取对象: {distance:.3f}m (触发阈值: {self.grasp_trigger_distance}m)")
+        
+        if distance > self.grasp_trigger_distance:
+            print(f"      距离超出触发范围，跳过抓取")
+            return
+        
+        print(f"      触发抓取任务! 距离: {distance:.3f}m")
+        
+        # 记录返回位置
+        self.return_position = robot_pos.copy()
+        
+        # 执行优化的抓取序列 - 先姿态，再移动，再抓取
+        self._execute_optimized_grasp_sequence(grasp_obj)
+        
+        # 运输到KLT框子
+        self._deliver_to_klt_box_with_real_arm(grasp_obj)
+        
+        # 返回继续覆盖
+        self._return_to_coverage()
+    
+    def _execute_optimized_grasp_sequence(self, grasp_obj: SceneObject):
+        """执行优化抓取序列 - 先变姿态，再移动到抓取点，再抓取"""
+        print(f"        执行优化抓取策略: 先姿态→移动→抓取→抬起")
+        
+        # 步骤1: 机械臂先变成抓取姿态，张开夹爪
+        print(f"        1. 机械臂准备抓取姿态")
+        self._control_gripper_with_test_params("open")
+        self._move_arm_to_pose("grasp_approach")
+        
+        # 步骤2: 移动到抓取点
+        print(f"        2. 移动到抓取点")
+        self._move_to_grasp_position(grasp_obj)
+        
+        # 步骤3: 闭合夹爪抓取
+        print(f"        3. 闭合夹爪抓取")
+        self._control_gripper_with_test_params("close")
+        
+        # 步骤4: 抬起物体
+        print(f"        4. 抬起物体")
+        self._move_arm_to_pose("grasp_lift")
+        
+        # 标记为运输中 - 不消失物体，通过真实抓取移动
+        self.carrying_object = grasp_obj
+        grasp_obj.is_active = False
+        self.coverage_stats['grasped_objects'] += 1
+        
+        print(f"        优化抓取序列完成 - 物体保持可见状态")
+    
+    def _move_to_grasp_position(self, grasp_obj: SceneObject):
+        """移动到抓取位置 - 精确对准"""
+        object_pos = grasp_obj.position
+        current_pos, current_yaw = self.robot_controller._get_robot_pose()
+        
+        # 计算从当前位置到对象的方向
+        direction_to_object = object_pos[:2] - current_pos[:2]
+        distance_to_object = np.linalg.norm(direction_to_object)
+        
+        print(f"          对象位置: [{object_pos[0]:.3f}, {object_pos[1]:.3f}]")
+        print(f"          当前位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}]")
+        print(f"          当前距离: {distance_to_object:.3f}m")
+        
+        # 计算目标角度 - 面向抓取对象
+        target_yaw = np.arctan2(direction_to_object[1], direction_to_object[0])
+        print(f"          目标角度: {np.degrees(target_yaw):.1f}°")
+        
+        # 先精确角度调整
+        self._precise_angle_adjustment(target_yaw)
+        
+        # 计算停止位置 - 距离对象0.295米
+        if distance_to_object > self.grasp_approach_distance:
+            direction_norm = direction_to_object / distance_to_object
+            approach_pos = object_pos[:2] - direction_norm * self.grasp_approach_distance
+            approach_pos_3d = np.array([approach_pos[0], approach_pos[1], 0.0])
+            
+            print(f"          接近位置: [{approach_pos_3d[0]:.3f}, {approach_pos_3d[1]:.3f}]")
+            
+            # 移动到接近位置
+            self.robot_controller.move_to_position_robust(approach_pos_3d, target_yaw)
+        else:
+            print(f"          已在接近距离内，无需移动")
+        
+        print(f"          移动到抓取位置完成")
+    
+    def _precise_angle_adjustment(self, target_yaw: float):
+        """精确角度调整 - 优化角度控制"""
+        print(f"            执行精确角度调整到: {np.degrees(target_yaw):.1f}°")
+        
+        max_angle_steps = 250
+        
+        for step in range(max_angle_steps):
+            current_pos, current_yaw = self.robot_controller._get_robot_pose()
+            
+            # 计算角度误差
+            angle_error = self._normalize_angle(target_yaw - current_yaw)
+            
+            # 优化：使用更小的角度容差
+            if abs(angle_error) < self.angle_tolerance:
+                print(f"            角度调整完成! 误差: {np.degrees(angle_error):.2f}°")
+                break
+            
+            # 优化：使用更大的角速度增益和最大角速度
+            angular_vel = np.clip(self.angular_kp * angle_error, 
+                                -self.max_angular_vel, self.max_angular_vel)
+            
+            # 发送角度调整指令
+            self._send_velocity_command(0.0, angular_vel)
+            self.world.step(render=True)
+            
+            if step % 50 == 0:
+                print(f"              角度调整中... 误差: {np.degrees(angle_error):.2f}°")
+        
+        # 停止旋转
+        self._send_velocity_command(0.0, 0.0)
+        
+        # 最终验证角度
+        final_pos, final_yaw = self.robot_controller._get_robot_pose()
+        final_angle_error = self._normalize_angle(target_yaw - final_yaw)
+        print(f"            最终角度误差: {np.degrees(final_angle_error):.2f}°")
+    
     def _control_gripper_with_test_params(self, action: str):
         """控制夹爪 - 使用test.py验证参数"""
         print(f"    执行夹爪动作: {action} (test.py参数)")
@@ -939,10 +986,7 @@ class FourObjectCoverageSystem:
         articulation_controller = self.mobile_base.get_articulation_controller()
         
         # 设置夹爪位置 - 使用test.py验证参数
-        if action == "close":
-            gripper_pos = self.gripper_close_pos
-        else:  # "open"
-            gripper_pos = self.gripper_open_pos
+        gripper_pos = self.gripper_close_pos if action == "close" else self.gripper_open_pos
         
         # 获取当前关节位置，避免其他关节移动
         current_joint_positions = self.mobile_base.get_joint_positions()
@@ -970,15 +1014,12 @@ class FourObjectCoverageSystem:
         print(f"    夹爪动作完成: {action} -> {gripper_pos}m (稳定{self.gripper_stabilization_time}s)")
     
     def _deliver_to_klt_box_with_real_arm(self, grasp_obj: SceneObject):
-        """运送到KLT框子 - 真实机械臂版本"""
-        print(f"        运送到KLT框子...")
+        """运输到KLT框子 - 真实机械臂版本"""
+        print(f"        运输到KLT框子...")
         
         # 找到KLT框子任务区域
         klt_boxes = [obj for obj in self.scene_objects if obj.object_type == ObjectType.TASK and obj.is_active]
-        if not klt_boxes:
-            print(f"        没有找到KLT框子")
-            return
-            
+        
         klt_box = klt_boxes[0]
         klt_position = klt_box.position.copy()
         
@@ -1013,20 +1054,8 @@ class FourObjectCoverageSystem:
                         is_safe = False
                         break
             
-            if is_safe:
-                distance = np.linalg.norm(current_pos[:2] - candidate_pos[:2])
-                approach_candidates.append((candidate_pos, distance, offset))
-        
-        # 如果没有安全的接近点，使用最远接近点
-        if not approach_candidates:
-            print(f"        警告: 所有接近点都有障碍物冲突，使用最远接近点")
-            for offset in approach_offsets:
-                candidate_pos = klt_position.copy()
-                candidate_pos[0] += offset[0]
-                candidate_pos[1] += offset[1] 
-                candidate_pos[2] = 0.0
-                distance = np.linalg.norm(current_pos[:2] - candidate_pos[:2])
-                approach_candidates.append((candidate_pos, distance, offset))
+            distance = np.linalg.norm(current_pos[:2] - candidate_pos[:2])
+            approach_candidates.append((candidate_pos, distance, offset))
         
         # 选择距离最近的安全接近点
         approach_candidates.sort(key=lambda x: x[1])
@@ -1038,22 +1067,18 @@ class FourObjectCoverageSystem:
         # 导航到接近位置（集成激光雷达避障）
         success = self.robot_controller.move_to_position_robust(approach_pos)
         
-        if success:
-            # 检查是否足够接近KLT框子
-            current_pos, _ = self.robot_controller._get_robot_pose()
-            distance_to_klt = np.linalg.norm(current_pos[:2] - klt_position[:2])
-            
-            print(f"        当前到KLT框子距离: {distance_to_klt:.3f}m")
-            
-            # 优化：使用更宽松的距离检查，因为接近距离已经减小
-            if distance_to_klt <= self.klt_approach_distance + 0.3:
-                # 足够接近，可以投放
-                self._perform_release_with_real_arm_and_physics(grasp_obj, klt_box)
-                print(f"        运送到KLT框子完成")
-            else:
-                print(f"        距离KLT框子太远: {distance_to_klt:.3f}m > {self.klt_approach_distance + 0.3:.3f}m")
+        current_pos, _ = self.robot_controller._get_robot_pose()
+        distance_to_klt = np.linalg.norm(current_pos[:2] - klt_position[:2])
+        
+        print(f"        当前到KLT框子距离: {distance_to_klt:.3f}m")
+        
+        # 优化：使用更宽松的距离检查，因为接近距离已经减小
+        if distance_to_klt <= self.klt_approach_distance + 0.3:
+            # 足够接近，可以投放
+            self._perform_release_with_real_arm_and_physics(grasp_obj, klt_box)
+            print(f"        运输到KLT框子完成")
         else:
-            print(f"        导航到KLT框子失败")
+            print(f"        距离KLT框子太远: {distance_to_klt:.3f}m > {self.klt_approach_distance + 0.3:.3f}m")
     
     def _perform_release_with_real_arm_and_physics(self, grasp_obj: SceneObject, klt_box: SceneObject):
         """执行真实机械臂释放到KLT框子 - 保持物体物理状态"""
@@ -1188,18 +1213,20 @@ class FourObjectCoverageSystem:
         print(f"任务完成率:")
         print(f"  清扫任务: {sweep_rate:.1f}%")
         print(f"  KLT框子投放任务: {grasp_rate:.1f}%")
+        print("优化抓取策略: 先姿态→移动→抓取→抬起，流程更高效！")
         print("KLT框子四类对象覆盖任务完成（集成激光雷达实时避障系统 + 真实Franka机械臂抓取）!")
     
     def run_demo(self):
         """运行演示"""
         print("\n" + "="*80)
         print("四类对象真实移动覆盖算法机器人系统 - KLT框子任务区域版 + 激光雷达避障 + 真实Franka抓取")
-        print("障碍物避障 | 清扫目标消失 | 抓取运送 | KLT框子投放")
+        print("障碍物避障 | 清扫目标消失 | 抓取运输 | KLT框子投放")
         print("优化路径规划 | 距离判断到达 | 智能弓字形避障")
         print("集成超丝滑实时覆盖区域可视化 | KLT框子USD资产")
         print("激光雷达分层避障 | 紧急避障 | 动态路径重规划")
         print("真实Franka机械臂抓取 | 精确关节控制 | 稳定化处理")
         print("优化特性: 精确角度控制 | 减小接近距离 | 提高控制精度")
+        print("优化抓取策略: 先姿态→移动→抓取→抬起")
         print("="*80)
         
         pos, yaw = self.robot_controller._get_robot_pose()
@@ -1213,6 +1240,7 @@ class FourObjectCoverageSystem:
         # 展示机械臂配置
         print(f"Franka机械臂配置: {len(self.arm_poses)}个预设姿态 (test.py验证)")
         print(f"优化配置: 角度容差{self.angle_tolerance}rad, KLT接近距离{self.klt_approach_distance}m")
+        print(f"抓取策略: 先姿态→移动→抓取→抬起 (更高效)")
         
         self.plan_coverage_mission()
         
@@ -1224,6 +1252,7 @@ class FourObjectCoverageSystem:
         print("激光雷达实时避障系统运行正常!")
         print("真实Franka机械臂抓取系统运行完美!")
         print("优化功能: 精确角度控制和距离优化已生效!")
+        print("抓取策略优化: 先姿态→移动→抓取→抬起流程更加高效!")
     
     def cleanup(self):
         """清理系统"""
@@ -1277,13 +1306,20 @@ def main():
     print("  7-DOF精确关节控制")
     print("  真实物理夹爪操作")
     print("  机械臂稳定化处理")
-    print("  完整抓取-运送-释放流程")
+    print("  完整抓取-运输-释放流程")
     print("")
     print("优化特性:")
     print("  精确角度控制 - 角度容差0.05rad")
     print("  增强角速度控制 - 角速度增益5.0, 最大角速度2.0rad/s")
     print("  KLT接近距离优化 - 从1.2m减至1.0m")
     print("  位置容差优化 - 从0.2m减至0.15m")
+    print("")
+    print("抓取策略优化:")
+    print("  先姿态: 机械臂先变成抓取姿态，张开夹爪")
+    print("  再移动: 移动到抓取点进行精确对准")
+    print("  再抓取: 闭合夹爪抓取物体")
+    print("  再抬起: 抬起物体准备运输")
+    print("  流程更高效: 减少不必要的姿态转换")
     print("")
     print("超丝滑实时可视化特性:")
     print(f"  精细网格: {FINE_GRID_SIZE}m")
