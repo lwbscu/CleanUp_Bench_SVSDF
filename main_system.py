@@ -31,7 +31,7 @@ print(f"  2. 清扫目标(黄色) - 触碰消失")
 print(f"  3. 抓取物体(绿色) - 运送到KLT框子")
 print(f"  4. KLT框子任务区域 - 物体投放区域 (具有物理碰撞)")
 print(f"  5. 激光雷达实时避障 - 分层避障策略")
-print(f"  6. 真实Franka机械臂抓取 - 精确关节控制")
+print(f"  6. 真实Franka机械臂抓取 - 60步插帧丝滑移动，消除晃动")
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({
@@ -152,11 +152,11 @@ class FourObjectCoverageSystem:
         self.carrying_object = None
         self.return_position = None
         
-        print("真实Franka机械臂抓取系统初始化完成 - 使用test.py验证参数")
+        print("真实Franka机械臂抓取系统初始化完成 - 60步插帧丝滑移动")
         print(f"抓取触发距离: {self.grasp_trigger_distance}m")
         print(f"抓取接近距离: {self.grasp_approach_distance}m")
-        print(f"机械臂稳定时间: {self.arm_stabilization_time}s")
-        print(f"夹爪稳定时间: {self.gripper_stabilization_time}s")
+        print(f"机械臂60步插帧丝滑移动: 稳定无晃动")
+        print(f"夹爪60步插帧丝滑移动: 稳定无晃动")
         print(f"夹爪张开/闭合位置: {self.gripper_open_pos}m / {self.gripper_close_pos}m")
         print(f"优化：KLT接近距离调整为: {self.klt_approach_distance}m")
         print(f"优化：角度容差调整为: {self.angle_tolerance}rad")
@@ -624,42 +624,71 @@ class FourObjectCoverageSystem:
         print("控制增益设置完成")
     
     def _move_arm_to_pose(self, pose_name: str):
-        """移动机械臂到指定姿态 - 使用test.py验证参数"""
-        print(f"机械臂移动到: {pose_name}")
+        """移动机械臂到指定姿态 - 60步插帧平滑移动"""
+        print(f"机械臂丝滑移动到: {pose_name} (60步插帧)")
         
         target_positions = self.arm_poses[pose_name]
         articulation_controller = self.mobile_base.get_articulation_controller()
         
-        # 获取当前关节位置，保持夹爪状态
+        # 获取当前关节位置
         current_joint_positions = self.mobile_base.get_joint_positions()
         num_dofs = len(self.mobile_base.dof_names)
-        joint_positions = torch.zeros(num_dofs, dtype=torch.float32)
         
-        # 保持当前所有关节位置
-        for i in range(num_dofs):
-            joint_positions[i] = float(current_joint_positions[i])
-        
-        # 只设置机械臂关节位置，保持夹爪位置不变
+        # 获取机械臂关节的起始位置
         arm_joint_names = [f"panda_joint{i+1}" for i in range(7)]
-        set_joints = 0
+        start_positions = []
+        target_positions_filtered = []
+        arm_joint_indices = []
         
         for i, joint_name in enumerate(arm_joint_names):
             if joint_name in self.mobile_base.dof_names:
                 idx = self.mobile_base.dof_names.index(joint_name)
                 if i < len(target_positions):
-                    joint_positions[idx] = target_positions[i]
-                    set_joints += 1
+                    start_positions.append(float(current_joint_positions[idx]))
+                    target_positions_filtered.append(target_positions[i])
+                    arm_joint_indices.append(idx)
         
-        # 应用动作
-        action = ArticulationAction(joint_positions=joint_positions)
-        articulation_controller.apply_action(action)
+        start_positions = np.array(start_positions)
+        target_positions_filtered = np.array(target_positions_filtered)
         
-        # 等待稳定 - 使用test.py验证的时间
-        stabilization_steps = int(self.arm_stabilization_time * 60)  # 60 FPS
+        # 60步插帧移动
+        interpolation_steps = 60
+        for step in range(interpolation_steps):
+            # 计算插值系数 (使用平滑的 ease-in-out 曲线)
+            t = step / (interpolation_steps - 1)
+            smooth_t = 3 * t * t - 2 * t * t * t  # 平滑插值曲线
+            
+            # 计算当前步的关节位置
+            current_interpolated_positions = start_positions + smooth_t * (target_positions_filtered - start_positions)
+            
+            # 构建完整的关节位置数组
+            joint_positions = torch.zeros(num_dofs, dtype=torch.float32)
+            
+            # 保持当前所有关节位置
+            for i in range(num_dofs):
+                joint_positions[i] = float(current_joint_positions[i])
+            
+            # 设置插值后的机械臂关节位置
+            for i, idx in enumerate(arm_joint_indices):
+                joint_positions[idx] = float(current_interpolated_positions[i])
+            
+            # 应用动作
+            action = ArticulationAction(joint_positions=joint_positions)
+            articulation_controller.apply_action(action)
+            
+            # 每步都进行物理仿真
+            self.world.step(render=True)
+            
+            # 显示进度
+            if step % 15 == 0:
+                print(f"  丝滑移动进度: {step+1}/60 ({(step+1)/60*100:.1f}%)")
+        
+        # 最终稳定
+        stabilization_steps = 20  # 减少稳定时间，因为插帧已经很平滑了
         for _ in range(stabilization_steps):
             self.world.step(render=True)
         
-        print(f"  机械臂移动完成: {pose_name} (设置{set_joints}个关节，稳定{self.arm_stabilization_time}s)")
+        print(f"  机械臂丝滑移动完成: {pose_name} (60步插帧平滑移动)")
     
     def plan_coverage_mission(self):
         """规划覆盖任务"""
@@ -805,21 +834,18 @@ class FourObjectCoverageSystem:
         self._return_to_coverage()
     
     def _execute_full_grasp_sequence_with_test_params(self, grasp_obj: SceneObject):
-        """执行完整抓取序列 - 使用test.py验证参数和流程"""
-        print(f"        执行真实Franka机械臂抓取序列 (test.py验证参数)...")
+        """执行完整抓取序列 - 60步插帧丝滑移动"""
+        print(f"        执行真实Franka机械臂抓取序列 (60步插帧丝滑移动)...")
         
         # 步骤1: 定位到抓取对象正前方 - 精确对准
         self._position_for_grasp_precise(grasp_obj)
         
-        # 步骤2: 机械臂执行抓取动作 - test.py流程
-        #print("        2.1 闭合夹爪抓取")
-        #self._control_gripper_with_test_params("close")
-
+        # 步骤2: 机械臂执行抓取动作 - 60步插帧丝滑版本
         self._control_gripper_with_test_params("open")
-        print("        2.2 机械臂移动到抓取姿态")
+        print("        2.2 机械臂丝滑移动到抓取姿态(60步插帧)")
         self._move_arm_to_pose("grasp_approach")
         self._control_gripper_with_test_params("close")
-        print("        2.3 抬起物体")
+        print("        2.3 丝滑抬起物体(60步插帧)")
         self._move_arm_to_pose("grasp_lift")
         
         # 标记为运送中 - 不消失物体，通过真实抓取移动
@@ -827,7 +853,7 @@ class FourObjectCoverageSystem:
         grasp_obj.is_active = False
         self.coverage_stats['grasped_objects'] += 1
         
-        print(f"        Franka机械臂抓取完成 - 物体保持可见状态")
+        print(f"        Franka机械臂60步插帧丝滑抓取完成 - 物体保持可见状态")
     
     def _position_for_grasp_precise(self, grasp_obj: SceneObject):
         """精确定位到抓取对象 - 简化为直接朝向移动"""
@@ -941,46 +967,81 @@ class FourObjectCoverageSystem:
         return angle
     
     def _control_gripper_with_test_params(self, action: str):
-        """控制夹爪 - 使用test.py验证参数"""
-        print(f"    执行夹爪动作: {action} (test.py参数)")
+        """控制夹爪 - 60步插帧平滑移动"""
+        print(f"    执行夹爪丝滑动作: {action} (60步插帧)")
         
         gripper_names = ["panda_finger_joint1", "panda_finger_joint2"]
         articulation_controller = self.mobile_base.get_articulation_controller()
         
-        # 设置夹爪位置 - 使用test.py验证参数
+        # 设置目标夹爪位置
         if action == "close":
-            gripper_pos = self.gripper_close_pos
+            target_gripper_pos = self.gripper_close_pos
         else:  # "open"
-            gripper_pos = self.gripper_open_pos
+            target_gripper_pos = self.gripper_open_pos
         
-        # 获取当前关节位置，避免其他关节移动
+        # 获取当前关节位置
         current_joint_positions = self.mobile_base.get_joint_positions()
         num_dofs = len(self.mobile_base.dof_names)
-        joint_positions = torch.zeros(num_dofs, dtype=torch.float32)
         
-        # 保持当前所有关节位置 - 确保类型转换
-        for i in range(num_dofs):
-            joint_positions[i] = float(current_joint_positions[i])
+        # 获取夹爪关节的起始位置
+        gripper_start_positions = []
+        gripper_joint_indices = []
         
-        # 只修改夹爪关节位置
         for joint_name in gripper_names:
             if joint_name in self.mobile_base.dof_names:
                 idx = self.mobile_base.dof_names.index(joint_name)
-                joint_positions[idx] = gripper_pos
+                gripper_start_positions.append(float(current_joint_positions[idx]))
+                gripper_joint_indices.append(idx)
         
-        action_obj = ArticulationAction(joint_positions=joint_positions)
-        articulation_controller.apply_action(action_obj)
+        if not gripper_joint_indices:
+            print(f"    未找到夹爪关节，跳过夹爪控制")
+            return
         
-        # 夹爪稳定时间 - 使用test.py验证参数
-        stabilization_steps = int(self.gripper_stabilization_time * 60)  # 60 FPS
+        # 60步插帧移动
+        interpolation_steps = 60
+        for step in range(interpolation_steps):
+            # 计算插值系数 (使用平滑的 ease-in-out 曲线)
+            t = step / (interpolation_steps - 1)
+            smooth_t = 3 * t * t - 2 * t * t * t  # 平滑插值曲线
+            
+            # 计算当前步的夹爪位置
+            current_gripper_positions = []
+            for start_pos in gripper_start_positions:
+                interpolated_pos = start_pos + smooth_t * (target_gripper_pos - start_pos)
+                current_gripper_positions.append(interpolated_pos)
+            
+            # 构建完整的关节位置数组
+            joint_positions = torch.zeros(num_dofs, dtype=torch.float32)
+            
+            # 保持当前所有关节位置
+            for i in range(num_dofs):
+                joint_positions[i] = float(current_joint_positions[i])
+            
+            # 设置插值后的夹爪关节位置
+            for i, idx in enumerate(gripper_joint_indices):
+                joint_positions[idx] = float(current_gripper_positions[i])
+            
+            # 应用关节控制
+            action_obj = ArticulationAction(joint_positions=joint_positions)
+            articulation_controller.apply_action(action_obj)
+            
+            # 每步都进行物理仿真
+            self.world.step(render=True)
+            
+            # 显示进度
+            if step % 15 == 0:
+                print(f"      夹爪丝滑移动进度: {step+1}/60 ({(step+1)/60*100:.1f}%)")
+        
+        # 最终稳定
+        stabilization_steps = 10  # 减少稳定时间，因为插帧已经很平滑了
         for _ in range(stabilization_steps):
             self.world.step(render=True)
         
-        print(f"    夹爪动作完成: {action} -> {gripper_pos}m (稳定{self.gripper_stabilization_time}s)")
+        print(f"    夹爪丝滑动作完成: {action} -> {target_gripper_pos}m (60步插帧平滑移动)")
     
     def _ensure_gripper_closed_tight(self):
-        """确保夹爪紧密关闭 - 用于运输过程中防止松动"""
-        print(f"          检查夹爪状态，确保紧密关闭...")
+        """确保夹爪紧密关闭 - 60步插帧平滑移动"""
+        print(f"          检查夹爪状态，确保紧密关闭(60步插帧)...")
         
         gripper_names = ["panda_finger_joint1", "panda_finger_joint2"]
         articulation_controller = self.mobile_base.get_articulation_controller()
@@ -988,27 +1049,55 @@ class FourObjectCoverageSystem:
         # 获取当前关节位置
         current_joint_positions = self.mobile_base.get_joint_positions()
         num_dofs = len(self.mobile_base.dof_names)
-        joint_positions = torch.zeros(num_dofs, dtype=torch.float32)
         
-        # 保持当前所有关节位置
-        for i in range(num_dofs):
-            joint_positions[i] = float(current_joint_positions[i])
+        # 获取夹爪关节的起始位置
+        gripper_start_positions = []
+        gripper_joint_indices = []
         
-        # 强制设置夹爪为关闭位置
         for joint_name in gripper_names:
             if joint_name in self.mobile_base.dof_names:
                 idx = self.mobile_base.dof_names.index(joint_name)
-                joint_positions[idx] = self.gripper_close_pos
+                gripper_start_positions.append(float(current_joint_positions[idx]))
+                gripper_joint_indices.append(idx)
         
-        # 应用关节控制
-        action_obj = ArticulationAction(joint_positions=joint_positions)
-        articulation_controller.apply_action(action_obj)
+        if not gripper_joint_indices:
+            print(f"          未找到夹爪关节，跳过夹爪检查")
+            return
         
-        # 短暂稳定
-        for _ in range(30):  # 0.5秒稳定时间
+        # 30步插帧移动到关闭位置 (比正常夹爪控制快一些)
+        interpolation_steps = 30
+        target_gripper_pos = self.gripper_close_pos
+        
+        for step in range(interpolation_steps):
+            # 计算插值系数
+            t = step / (interpolation_steps - 1)
+            smooth_t = 3 * t * t - 2 * t * t * t  # 平滑插值曲线
+            
+            # 计算当前步的夹爪位置
+            current_gripper_positions = []
+            for start_pos in gripper_start_positions:
+                interpolated_pos = start_pos + smooth_t * (target_gripper_pos - start_pos)
+                current_gripper_positions.append(interpolated_pos)
+            
+            # 构建完整的关节位置数组
+            joint_positions = torch.zeros(num_dofs, dtype=torch.float32)
+            
+            # 保持当前所有关节位置
+            for i in range(num_dofs):
+                joint_positions[i] = float(current_joint_positions[i])
+            
+            # 设置插值后的夹爪关节位置
+            for i, idx in enumerate(gripper_joint_indices):
+                joint_positions[idx] = float(current_gripper_positions[i])
+            
+            # 应用关节控制
+            action_obj = ArticulationAction(joint_positions=joint_positions)
+            articulation_controller.apply_action(action_obj)
+            
+            # 每步都进行物理仿真
             self.world.step(render=True)
         
-        print(f"          夹爪状态检查完成，确保紧密关闭到 {self.gripper_close_pos}m")
+        print(f"          夹爪状态检查完成，丝滑确保紧密关闭到 {self.gripper_close_pos}m")
     
     def _deliver_to_klt_box_with_real_arm(self, grasp_obj: SceneObject):
         """运送到KLT框子 - 真实机械臂版本，加强夹爪稳定性"""
@@ -1109,12 +1198,12 @@ class FourObjectCoverageSystem:
             print(f"        导航到KLT框子失败")
     
     def _perform_release_with_real_arm_and_physics(self, grasp_obj: SceneObject, klt_box: SceneObject):
-        """执行真实机械臂释放到KLT框子 - 物体自然掉落"""
-        print(f"          执行真实Franka机械臂释放...")
+        """执行真实机械臂释放到KLT框子 - 60步插帧丝滑移动"""
+        print(f"          执行真实Franka机械臂释放(60步插帧丝滑移动)...")
         
-        # 机械臂移动到释放姿态并张开夹爪
-        self._move_arm_to_pose("carry")  # 保持抬起状态
-        self._control_gripper_with_test_params("open")    # 张开夹爪，物体自然掉落
+        # 机械臂移动到释放姿态并张开夹爪 - 60步插帧丝滑移动
+        self._move_arm_to_pose("carry")  # 保持抬起状态 - 60步插帧
+        self._control_gripper_with_test_params("open")    # 张开夹爪，物体自然掉落 - 60步插帧
         
         # 观察物体掉落过程
         for _ in range(30):
@@ -1123,14 +1212,14 @@ class FourObjectCoverageSystem:
         
         print(f"          物体自然掉落完成")
         
-        # 机械臂回到home姿态
+        # 机械臂回到home姿态 - 60步插帧丝滑移动
         self._move_arm_to_pose("home")
         
         # 更新统计
         self.carrying_object = None
         self.coverage_stats['delivered_objects'] += 1
         
-        print(f"          真实Franka机械臂释放完成")
+        print(f"          真实Franka机械臂60步插帧丝滑释放完成")
     
     def _return_to_coverage(self):
         """返回覆盖位置"""
@@ -1164,11 +1253,11 @@ class FourObjectCoverageSystem:
         print(f"  USD资产: {self.klt_box_usd_path}")
         print(f"  接近距离阈值: {self.klt_approach_distance}m (优化)")
         print(f"")
-        print(f"真实Franka机械臂抓取配置 (test.py验证参数):")
+        print(f"真实Franka机械臂抓取配置 (60步插帧丝滑移动):")
         print(f"  抓取触发距离: {self.grasp_trigger_distance}m")
         print(f"  抓取接近距离: {self.grasp_approach_distance}m")
-        print(f"  机械臂稳定时间: {self.arm_stabilization_time}s")
-        print(f"  夹爪稳定时间: {self.gripper_stabilization_time}s")
+        print(f"  机械臂60步插帧移动: 丝滑无晃动")
+        print(f"  夹爪60步插帧移动: 丝滑无晃动")
         print(f"  夹爪张开/闭合位置: {self.gripper_open_pos}m / {self.gripper_close_pos}m")
         print(f"")
         print(f"优化参数:")
@@ -1221,7 +1310,7 @@ class FourObjectCoverageSystem:
             print(f"激光雷达状态: {status}")
         
         # 展示机械臂配置
-        print(f"Franka机械臂配置: {len(self.arm_poses)}个预设姿态 (test.py验证)")
+        print("Franka机械臂配置: 60步插帧丝滑移动，稳定无晃动")
         print(f"优化配置: 角度容差{self.angle_tolerance}rad, KLT接近距离{self.klt_approach_distance}m")
         
         self.plan_coverage_mission()
@@ -1232,7 +1321,7 @@ class FourObjectCoverageSystem:
         
         print("\nKLT框子四类对象覆盖系统演示完成!")
         print("激光雷达实时避障系统运行正常!")
-        print("真实Franka机械臂抓取系统运行完美!")
+        print("真实Franka机械臂抓取系统运行完美! 60步插帧丝滑移动，无晃动!")
         print("优化功能: 精确角度控制和距离优化已生效!")
     
     def cleanup(self):
@@ -1283,10 +1372,11 @@ def main():
     print("  距离判断到达")
     print("  框内物体掉落投放")
     print("")
-    print("真实Franka机械臂抓取特性 (test.py验证参数):")
+    print("真实Franka机械臂抓取特性 (60步插帧丝滑移动):")
     print("  7-DOF精确关节控制")
+    print("  60步插帧丝滑移动")
     print("  真实物理夹爪操作")
-    print("  机械臂稳定化处理")
+    print("  消除机器人前后晃动")
     print("  完整抓取-运送-释放流程")
     print("")
     print("优化特性:")
