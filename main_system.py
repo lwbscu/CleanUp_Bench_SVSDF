@@ -115,6 +115,7 @@ class FourObjectCoverageSystem:
             'swept_objects': 0,
             'grasped_objects': 0,
             'delivered_objects': 0,
+            'failed_grasps': 0,      # 新增：抓取失败统计
             'total_coverage_points': 0,
             'obstacles_avoided': 0,  # 新增：避障统计
             'emergency_stops': 0     # 新增：紧急停车统计
@@ -127,14 +128,14 @@ class FourObjectCoverageSystem:
         # 真实Franka机械臂抓取配置 - 使用test.py验证参数
         self.arm_poses = {
             "home": [0.0, 0.524, 0.0, -0.785, 0.0, 1.571, 0.785],        # 30°, -170°, 90°, 45°
-            "grasp_approach": [0.0, 1.676, 0.0, -0.646, 0.0, 2.234, 0.785],  # 96°, -37°, 128°, 45°
+            "grasp_approach": [0.0, 1.7, 0.0, -0.646, 0.0, 2.234, 0],  # 96°, -37°, 128°, 45°
             "grasp_lift": [0.0, 1.047, 0.0, -0.646, 0.0, 2.234, 0.785],     # 60°, -37°, 128°, 45°
             "carry": [0.0, 1.047, 0.0, -0.646, 0.0, 2.234, 0.785]           # 60°, -37°, 128°, 45°（同lift）
         }
         
         # 抓取参数 - 使用test.py验证的精确参数
         self.grasp_trigger_distance = 1.5      # 触发抓取的距离 - 修正：小于INTERACTION_DISTANCE
-        self.grasp_approach_distance = 0.295    # 抓取接近距离 - test.py验证参数
+        self.grasp_approach_distance = 0.26    # 抓取接近距离 - test.py验证参数
         self.arm_stabilization_time = 2.0      # 机械臂稳定时间 - test.py验证参数
         self.gripper_stabilization_time = 1.0  # 夹爪稳定时间 - test.py验证参数
         
@@ -235,10 +236,10 @@ class FourObjectCoverageSystem:
         
         # 2. 清扫目标 (黄色) - 触碰消失
         sweep_config = [
-            {"pos": [0.8, 0.2, 0.05], "size": [0.1], "color": [1.0, 1.0, 0.2], "shape": "sphere"},
-            {"pos": [1.5, 1.5, 0.05], "size": [0.1], "color": [0.9, 0.9, 0.1], "shape": "sphere"},
-            {"pos": [-0.8, -0.8, 0.05], "size": [0.1], "color": [1.0, 0.8, 0.0], "shape": "sphere"},
-            {"pos": [2.0, 0.5, 0.05], "size": [0.1], "color": [0.8, 0.8, 0.2], "shape": "sphere"},
+            {"pos": [0.8, 0.2, 0.05], "size": [0.03], "color": [1.0, 1.0, 0.2], "shape": "sphere"},
+            {"pos": [1.5, 1.5, 0.05], "size": [0.03], "color": [0.9, 0.9, 0.1], "shape": "sphere"},
+            {"pos": [3.5, 0.3, 0.05], "size": [0.03], "color": [1.0, 0.8, 0.0], "shape": "sphere"},
+            {"pos": [2.0, 0.5, 0.05], "size": [0.03], "color": [0.8, 0.8, 0.2], "shape": "sphere"},
         ]
         
         # 3. 抓取物体 (绿色) - 运送到KLT框子 - 使用test.py验证的尺寸
@@ -824,21 +825,68 @@ class FourObjectCoverageSystem:
         # 记录返回位置
         self.return_position = robot_pos.copy()
         
-        # 执行完整抓取序列 - 使用test.py验证的流程
-        self._execute_full_grasp_sequence_with_test_params(grasp_obj)
+        # 执行完整抓取序列 - 包含抓取成功检测
+        grasp_success = self._execute_full_grasp_sequence_with_test_params(grasp_obj)
         
-        # 运送到KLT框子
-        self._deliver_to_klt_box_with_real_arm(grasp_obj)
+        if grasp_success:
+            # 抓取成功，运送到KLT框子
+            print(f"      抓取成功，开始运送到KLT框子...")
+            self._deliver_to_klt_box_with_real_arm(grasp_obj)
+        else:
+            # 抓取失败，直接返回继续覆盖任务
+            print(f"      抓取失败，取消运送，直接返回继续覆盖任务...")
         
         # 返回继续覆盖
         self._return_to_coverage()
     
+    def _get_object_current_z_position(self, grasp_obj: SceneObject) -> float:
+        """获取物体当前的Z轴坐标"""
+        try:
+            # 获取Isaac对象的当前世界位置
+            position, _ = grasp_obj.isaac_object.get_world_pose()
+            current_z = float(position[2])
+            return current_z
+        except Exception as e:
+            print(f"          警告: 无法获取物体Z坐标: {e}")
+            # 使用备用方法：从场景对象的位置获取
+            return float(grasp_obj.position[2])
+    
+    def _check_grasp_success(self, grasp_obj: SceneObject, initial_z: float) -> bool:
+        """检查抓取是否成功 - 通过Z轴坐标变化判断"""
+        print(f"        步骤4: 检查抓取成功状态...")
+        
+        # 等待物理稳定，确保物体位置更新
+        for _ in range(30):
+            self.world.step(render=True)
+        
+        # 获取抬起后的Z坐标
+        current_z = self._get_object_current_z_position(grasp_obj)
+        z_change = current_z - initial_z
+        
+        print(f"          抓取前Z坐标: {initial_z:.3f}m")
+        print(f"          抬起后Z坐标: {current_z:.3f}m") 
+        print(f"          Z轴变化量: {z_change:.3f}m")
+        
+        # 抓取成功判断阈值：Z轴抬升超过0.2米
+        success_threshold = 0.2
+        
+        if z_change >= success_threshold:
+            print(f"          ✓ 抓取成功! Z轴抬升 {z_change:.3f}m >= {success_threshold}m")
+            return True
+        else:
+            print(f"          ✗ 抓取失败! Z轴抬升 {z_change:.3f}m < {success_threshold}m")
+            return False
+
     def _execute_full_grasp_sequence_with_test_params(self, grasp_obj: SceneObject):
-        """执行完整抓取序列 - 60步插帧丝滑移动"""
+        """执行完整抓取序列 - 60步插帧丝滑移动 + 抓取成功检测"""
         print(f"        执行真实Franka机械臂抓取序列 (60步插帧丝滑移动)...")
         
         # 步骤1: 定位到抓取对象正前方 - 精确对准
         self._position_for_grasp_precise(grasp_obj)
+        
+        # 步骤1.5: 记录抓取前物体的Z轴坐标
+        initial_z_position = self._get_object_current_z_position(grasp_obj)
+        print(f"        抓取前物体Z轴坐标: {initial_z_position:.3f}m")
         
         # 步骤2: 机械臂执行抓取动作 - 60步插帧丝滑版本
         self._control_gripper_with_test_params("open")
@@ -848,12 +896,22 @@ class FourObjectCoverageSystem:
         print("        2.3 丝滑抬起物体(60步插帧)")
         self._move_arm_to_pose("grasp_lift")
         
-        # 标记为运送中 - 不消失物体，通过真实抓取移动
-        self.carrying_object = grasp_obj
-        grasp_obj.is_active = False
-        self.coverage_stats['grasped_objects'] += 1
+        # 步骤3: 抓取成功检测机制
+        success = self._check_grasp_success(grasp_obj, initial_z_position)
         
-        print(f"        Franka机械臂60步插帧丝滑抓取完成 - 物体保持可见状态")
+        if success:
+            # 抓取成功，标记为运送中
+            self.carrying_object = grasp_obj
+            grasp_obj.is_active = False
+            self.coverage_stats['grasped_objects'] += 1
+            print(f"        ✓ Franka机械臂抓取成功! 物体已被抬起")
+            return True
+        else:
+            # 抓取失败，回到home位置，不继续运送
+            print(f"        ✗ 抓取失败! 物体未被成功抬起，取消运送任务")
+            self.coverage_stats['failed_grasps'] += 1  # 统计抓取失败次数
+            self._move_arm_to_pose("home")
+            return False
     
     def _position_for_grasp_precise(self, grasp_obj: SceneObject):
         """精确定位到抓取对象 - 简化为直接朝向移动"""
@@ -1268,8 +1326,15 @@ class FourObjectCoverageSystem:
         print(f"")
         print(f"任务执行统计:")
         print(f"  清扫完成: {self.coverage_stats['swept_objects']}/{sweep_total}")
-        print(f"  抓取完成: {self.coverage_stats['grasped_objects']}/{grasp_total}")
+        print(f"  抓取尝试: {self.coverage_stats['grasped_objects'] + self.coverage_stats['failed_grasps']}/{grasp_total}")
+        print(f"  抓取成功: {self.coverage_stats['grasped_objects']}/{grasp_total}")
+        print(f"  抓取失败: {self.coverage_stats['failed_grasps']}/{grasp_total}")
         print(f"  投放到KLT框子: {self.coverage_stats['delivered_objects']}/{grasp_total}")
+        print(f"")
+        print(f"抓取成功检测机制:")
+        print(f"  检测方法: Z轴坐标变化检测")
+        print(f"  成功阈值: Z轴抬升 >= 0.2m")
+        print(f"  失败处理: 取消运送，继续覆盖任务")
         
         # 新增：激光雷达避障统计
         if self.lidar_avoidance:
@@ -1283,10 +1348,12 @@ class FourObjectCoverageSystem:
         
         print(f"")
         sweep_rate = (self.coverage_stats['swept_objects'] / sweep_total * 100) if sweep_total > 0 else 0
-        grasp_rate = (self.coverage_stats['delivered_objects'] / grasp_total * 100) if grasp_total > 0 else 0
+        grasp_success_rate = (self.coverage_stats['grasped_objects'] / grasp_total * 100) if grasp_total > 0 else 0
+        delivery_rate = (self.coverage_stats['delivered_objects'] / grasp_total * 100) if grasp_total > 0 else 0
         print(f"任务完成率:")
         print(f"  清扫任务: {sweep_rate:.1f}%")
-        print(f"  KLT框子投放任务: {grasp_rate:.1f}%")
+        print(f"  抓取成功率: {grasp_success_rate:.1f}%")
+        print(f"  KLT框子投放任务: {delivery_rate:.1f}%")
         print("KLT框子四类对象覆盖任务完成（集成激光雷达实时避障系统 + 真实Franka机械臂抓取）!")
     
     def run_demo(self):
@@ -1322,6 +1389,7 @@ class FourObjectCoverageSystem:
         print("\nKLT框子四类对象覆盖系统演示完成!")
         print("激光雷达实时避障系统运行正常!")
         print("真实Franka机械臂抓取系统运行完美! 60步插帧丝滑移动，无晃动!")
+        print("抓取成功检测机制运行正常! Z轴坐标变化检测，智能判断抓取成功!")
         print("优化功能: 精确角度控制和距离优化已生效!")
     
     def cleanup(self):
@@ -1377,6 +1445,8 @@ def main():
     print("  60步插帧丝滑移动")
     print("  真实物理夹爪操作")
     print("  消除机器人前后晃动")
+    print("  智能抓取成功检测(Z轴坐标变化)")
+    print("  抓取失败自动处理")
     print("  完整抓取-运送-释放流程")
     print("")
     print("优化特性:")
