@@ -54,6 +54,7 @@ class SceneObject:
     color: np.ndarray = None
     is_active: bool = True
     original_position: np.ndarray = None
+    grasp_failed: bool = False  # 新增：标记抓取失败，不再尝试抓取
 
 @dataclass
 class CoveragePoint:
