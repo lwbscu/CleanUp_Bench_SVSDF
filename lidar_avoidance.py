@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 激光雷达避障模块
-基于ROS1 LaserScan数据实现分层避障策略
 """
 
 import numpy as np
@@ -11,167 +10,111 @@ from sensor_msgs.msg import LaserScan, PointCloud2
 from typing import List, Tuple, Optional
 from data_structures import *
 
-# 尝试导入点云处理模块
 try:
     import sensor_msgs.point_cloud2 as pc2
     PC2_AVAILABLE = True
 except ImportError:
     PC2_AVAILABLE = False
-    rospy.logwarn("sensor_msgs.point_cloud2 不可用，将使用手动解析")
 
 class LidarAvoidanceController:
-    """激光雷达分层避障控制器"""
+    """激光雷达避障控制器"""
     
     def __init__(self):
-        # 避障参数
-        self.min_scan_range = 0.5      # 激光雷达最近检测距离
-        self.danger_distance = 0.6     # 危险距离阈值
-        self.warning_distance = 0.65    # 警告距离阈值
-        self.safe_distance = 0.8       # 安全距离阈值
-
-        # 速度调节参数
-        self.danger_speed_factor = 0.0   # 危险区域速度因子（停止）
-        self.warning_speed_factor = 0.3  # 警告区域速度因子
-        self.safe_speed_factor = 0.8     # 安全区域速度因子
-        
-        # 角度扇区划分（度）
-        self.front_angle_range = 60      # 前方扇区角度范围 ±30度
-        self.side_angle_range = 120      # 侧方扇区角度范围 ±60度
-        
-        # 当前激光数据
+        self.min_scan_range = 0.5
+        self.danger_distance = 0.6
+        self.warning_distance = 0.65
+        self.safe_distance = 0.8
+        self.danger_speed_factor = 0.0
+        self.warning_speed_factor = 0.3
+        self.safe_speed_factor = 0.8
+        self.front_angle_range = 60
+        self.side_angle_range = 120
         self.current_scan = None
         self.last_scan_time = rospy.Time.now()
-        
-        # 避障状态
-        self.avoidance_mode = "NORMAL"  # NORMAL, WARNING, DANGER
-        self.preferred_direction = None  # 偏好转向方向
-        
-        # 距离输出控制
+        self.avoidance_mode = "NORMAL"
+        self.preferred_direction = None
         self.last_distance_output_time = rospy.Time.now()
-        self.distance_output_interval = 10.0  # 每隔1秒输出一次距离信息
+        self.distance_output_interval = 10.0
         
-        # ROS订阅器 - 修改为订阅PointCloud2格式
         self.laser_sub = rospy.Subscriber('/robot_lidar_pointcloud', PointCloud2, 
                                         self.pointcloud_callback, queue_size=1)
-        
-        # 保持LaserScan数据结构用于后续处理
         self.simulated_scan = None
         
-        print("激光雷达分层避障控制器初始化完成")
-        print(f"危险距离: {self.danger_distance}m")
-        print(f"警告距离: {self.warning_distance}m") 
-        print(f"安全距离: {self.safe_distance}m")
+        print("激光雷达避障控制器初始化完成")
     
     def pointcloud_callback(self, pointcloud_msg: PointCloud2):
-        """点云数据回调 - 转换为LaserScan格式处理"""
-        try:
-            # 将PointCloud2转换为LaserScan格式进行后续处理
-            simulated_scan = self._convert_pointcloud_to_laserscan(pointcloud_msg)
-            if simulated_scan:
-                self.current_scan = simulated_scan
-                self.last_scan_time = rospy.Time.now()
-                
-                # 实时分析障碍物分布
-                self._analyze_obstacles()
-        except Exception as e:
-            rospy.logwarn(f"点云处理失败: {e}")
+        """点云数据回调"""
+        simulated_scan = self._convert_pointcloud_to_laserscan(pointcloud_msg)
+        if simulated_scan:
+            self.current_scan = simulated_scan
+            self.last_scan_time = rospy.Time.now()
+            self._analyze_obstacles()
     
     def _convert_pointcloud_to_laserscan(self, pointcloud_msg: PointCloud2) -> Optional[LaserScan]:
         """将PointCloud2转换为LaserScan格式"""
-        try:
-            # 创建模拟的LaserScan消息
-            scan = LaserScan()
-            scan.header = pointcloud_msg.header
+        scan = LaserScan()
+        scan.header = pointcloud_msg.header
+        scan.angle_min = -math.pi
+        scan.angle_max = math.pi
+        scan.angle_increment = math.radians(1.0)
+        scan.range_min = 0.1
+        scan.range_max = 10.0
+        scan.time_increment = 0.0
+        scan.scan_time = 0.1
+        
+        num_points = int((scan.angle_max - scan.angle_min) / scan.angle_increment)
+        scan.ranges = [float('inf')] * num_points
+        
+        points = []
+        if PC2_AVAILABLE:
+            for point in pc2.read_points(pointcloud_msg, field_names=("x", "y", "z"), skip_nans=True):
+                x, y, z = point
+                points.append((x, y, z))
+        else:
+            points = self._parse_pointcloud_manually(pointcloud_msg)
+        
+        for x, y, z in points:
+            if abs(z) > 0.5:
+                continue
             
-            # 设置LaserScan参数
-            scan.angle_min = -math.pi  # -180度
-            scan.angle_max = math.pi   # +180度
-            scan.angle_increment = math.radians(1.0)  # 1度分辨率
-            scan.range_min = 0.1
-            scan.range_max = 10.0
-            scan.time_increment = 0.0
-            scan.scan_time = 0.1
+            distance = math.sqrt(x*x + y*y)
+            if distance < scan.range_min or distance > scan.range_max:
+                continue
             
-            # 初始化距离数组
-            num_points = int((scan.angle_max - scan.angle_min) / scan.angle_increment)
-            scan.ranges = [float('inf')] * num_points
-            
-            # 解析点云数据
-            points = []
-            if PC2_AVAILABLE:
-                try:
-                    # 使用pc2库解析点云
-                    for point in pc2.read_points(pointcloud_msg, field_names=("x", "y", "z"), skip_nans=True):
-                        x, y, z = point
-                        points.append((x, y, z))
-                except Exception as e:
-                    rospy.logwarn(f"pc2解析失败: {e}")
-                    points = self._parse_pointcloud_manually(pointcloud_msg)
-            else:
-                # 手动解析点云
-                points = self._parse_pointcloud_manually(pointcloud_msg)
-            
-            # 将3D点投影到2D激光扫描
-            for x, y, z in points:
-                # 过滤高度范围（只考虑机器人高度附近的点）
-                if abs(z) > 0.5:
-                    continue
-                
-                # 计算距离和角度
-                distance = math.sqrt(x*x + y*y)
-                if distance < scan.range_min or distance > scan.range_max:
-                    continue
-                
-                angle = math.atan2(y, x)
-                
-                # 计算对应的数组索引
-                angle_index = int((angle - scan.angle_min) / scan.angle_increment)
-                if 0 <= angle_index < len(scan.ranges):
-                    # 保存最近的距离
-                    if distance < scan.ranges[angle_index]:
-                        scan.ranges[angle_index] = distance
-            
-            # 将无穷大值替换为最大范围
-            for i in range(len(scan.ranges)):
-                if scan.ranges[i] == float('inf'):
-                    scan.ranges[i] = scan.range_max
-            
-            return scan
-            
-        except Exception as e:
-            rospy.logwarn(f"PointCloud2转换LaserScan失败: {e}")
-            return None
+            angle = math.atan2(y, x)
+            angle_index = int((angle - scan.angle_min) / scan.angle_increment)
+            if 0 <= angle_index < len(scan.ranges):
+                if distance < scan.ranges[angle_index]:
+                    scan.ranges[angle_index] = distance
+        
+        for i in range(len(scan.ranges)):
+            if scan.ranges[i] == float('inf'):
+                scan.ranges[i] = scan.range_max
+        
+        return scan
     
     def _parse_pointcloud_manually(self, pointcloud_msg: PointCloud2) -> List[Tuple[float, float, float]]:
-        """手动解析点云数据（当pc2不可用时）"""
+        """手动解析点云数据"""
         points = []
-        try:
-            # 简化的手动解析 - 这个实现可能需要根据实际点云格式调整
-            import struct
-            
-            # 假设点云是x,y,z float32格式
-            point_step = pointcloud_msg.point_step
-            for i in range(pointcloud_msg.width):
-                offset = i * point_step
-                if offset + 12 <= len(pointcloud_msg.data):  # 3 * 4字节
-                    x = struct.unpack('f', pointcloud_msg.data[offset:offset+4])[0]
-                    y = struct.unpack('f', pointcloud_msg.data[offset+4:offset+8])[0]
-                    z = struct.unpack('f', pointcloud_msg.data[offset+8:offset+12])[0]
-                    
-                    # 过滤无效值
-                    if not (math.isnan(x) or math.isnan(y) or math.isnan(z)):
-                        points.append((x, y, z))
-        except Exception as e:
-            rospy.logwarn(f"手动解析点云失败: {e}")
+        import struct
+        
+        point_step = pointcloud_msg.point_step
+        for i in range(pointcloud_msg.width):
+            offset = i * point_step
+            if offset + 12 <= len(pointcloud_msg.data):
+                x = struct.unpack('f', pointcloud_msg.data[offset:offset+4])[0]
+                y = struct.unpack('f', pointcloud_msg.data[offset+4:offset+8])[0]
+                z = struct.unpack('f', pointcloud_msg.data[offset+8:offset+12])[0]
+                
+                if not (math.isnan(x) or math.isnan(y) or math.isnan(z)):
+                    points.append((x, y, z))
         
         return points
 
     def laser_callback(self, scan_msg: LaserScan):
-        """激光雷达数据回调（保留用于LaserScan格式）"""
+        """激光雷达数据回调"""
         self.current_scan = scan_msg
         self.last_scan_time = rospy.Time.now()
-        
-        # 实时分析障碍物分布
         self._analyze_obstacles()
     
     def _analyze_obstacles(self):

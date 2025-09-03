@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 主系统模块 - KLT框架任务区域集成版
-四类对象覆盖系统的主要逻辑和程序入口
-集成激光雷达实时避障功能
-新增：真实Franka机械臂抓取功能 - 使用test.py验证参数
-优化：精确角度控制和释放距离调整
 """
 
 import psutil
@@ -23,16 +19,6 @@ def print_memory_usage(stage_name: str = ""):
     memory_mb = memory_info.rss / 1024 / 1024
     print(f"内存: {memory_mb:.1f}MB - {stage_name}")
 
-# 先初始化SimulationApp，再导入Isaac Sim模块
-print("启动KLT框架任务区域版四类对象覆盖算法机器人系统...")
-print(f"对象类型:")
-print(f"  1. 障碍物(红色) - 路径规划避障")
-print(f"  2. 清扫目标(黄色) - 触碰消失") 
-print(f"  3. 抓取物体(绿色) - 运送到KLT框子")
-print(f"  4. KLT框子任务区域 - 物体投放区域 (具有物理碰撞)")
-print(f"  5. 激光雷达实时避障 - 分层避障策略")
-print(f"  6. 真实Franka机械臂抓取 - 60步插帧丝滑移动，消除晃动")
-
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({
     "headless": False,
@@ -43,42 +29,25 @@ simulation_app = SimulationApp({
     "rendering_dt": 1.0/30.0,
 })
 
-# 初始化ROS节点 - 新增
-print("初始化ROS节点...")
 rospy.init_node('isaac_sim_lidar_robot', anonymous=True)
 
-# 添加这段：检查并启用ROS Bridge
-print("检查ROS Bridge扩展状态...")
+# 检查ROS Bridge扩展
 import omni.kit.app
 import carb
 
-# 获取扩展管理器
 ext_manager = omni.kit.app.get_app().get_extension_manager()
 
-# 检查ROS Bridge是否启用
 if not ext_manager.is_extension_enabled("omni.isaac.ros_bridge"):
-    print("启用ROS Bridge扩展...")
     ext_manager.set_extension_enabled_immediate("omni.isaac.ros_bridge", True)
-    print("ROS Bridge扩展已启用")
-else:
-    print("ROS Bridge扩展已经启用")
 
-# 等待扩展完全加载
 simulation_app.update()
 simulation_app.update()
 simulation_app.update()
 
 # 检查roscore连接
-print("检查roscore连接...")
-try:
-    import rosgraph
-    if not rosgraph.is_master_online():
-        carb.log_warn("roscore未运行，请先运行: roscore")
-        print("警告: roscore未运行，请在另一个终端先运行: roscore")
-    else:
-        print("roscore连接正常")
-except ImportError:
-    print("警告: 无法导入rosgraph，请确保ROS环境正确设置")
+import rosgraph
+if rosgraph.is_master_online():
+    print("roscore连接正常")
 
 # 现在安全导入Isaac Sim核心模块
 from isaacsim.core.api import World
@@ -96,7 +65,7 @@ from robot_controller import FixedRobotController
 from lidar_avoidance import LidarAvoidanceController, DynamicPathReplanner  # 新增导入
 
 class FourObjectCoverageSystem:
-    """四类对象覆盖系统 - KLT框子任务区域版 + 激光雷达避障 + 真实Franka抓取"""
+    """四类对象覆盖系统"""
     
     def __init__(self):
         self.world = None
@@ -104,8 +73,6 @@ class FourObjectCoverageSystem:
         self.robot_controller = None
         self.path_planner = None
         self.visualizer = None
-        
-        # 新增：激光雷达避障系统
         self.lidar_avoidance = None
         self.dynamic_replanner = None
         
@@ -115,54 +82,35 @@ class FourObjectCoverageSystem:
             'swept_objects': 0,
             'grasped_objects': 0,
             'delivered_objects': 0,
-            'failed_grasps': 0,      # 新增：抓取失败统计
+            'failed_grasps': 0,
             'total_coverage_points': 0,
-            'obstacles_avoided': 0,  # 新增：避障统计
-            'emergency_stops': 0     # 新增：紧急停车统计
+            'obstacles_avoided': 0,
+            'emergency_stops': 0
         }
         
-        # KLT框子配置
         self.klt_box_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/NVIDIA/Assets/ArchVis/Lobby/My_asset/T/small_KLT.usd"
-        self.klt_approach_distance = 0.8 # 优化：减小距离，确保释放在框子内
+        self.klt_approach_distance = 0.8
         
-        # 真实Franka机械臂抓取配置 - 使用test.py验证参数
         self.arm_poses = {
-            "home": [0.0, 0.524, 0.0, -0.785, 0.0, 1.571, 0.785],        # 30°, -170°, 90°, 45°
-            "grasp_approach": [0.0, 1.7, 0.0, -0.646, 0.0, 2.234, 0],  # 96°, -37°, 128°, 45°
-            "grasp_lift": [0.0, 1.047, 0.0, -0.646, 0.0, 2.234, 0.785],     # 60°, -37°, 128°, 45°
-            "carry": [0.0, 1.047, 0.0, -0.646, 0.0, 2.234, 0.785]           # 60°, -37°, 128°, 45°（同lift）
+            "home": [0.0, 0.524, 0.0, -0.785, 0.0, 1.571, 0.785],
+            "grasp_approach": [0.0, 1.7, 0.0, -0.646, 0.0, 2.234, 0],
+            "grasp_lift": [0.0, 1.047, 0.0, -0.646, 0.0, 2.234, 0.785],
+            "carry": [0.0, 1.047, 0.0, -0.646, 0.0, 2.234, 0.785]
         }
         
-        # 抓取参数 - 使用test.py验证的精确参数
-        self.grasp_trigger_distance = 1.5      # 触发抓取的距离 - 修正：小于INTERACTION_DISTANCE
-        self.grasp_approach_distance = 0.26    # 抓取接近距离 - test.py验证参数
-        self.arm_stabilization_time = 2.0      # 机械臂稳定时间 - test.py验证参数
-        self.gripper_stabilization_time = 1.0  # 夹爪稳定时间 - test.py验证参数
+        self.grasp_trigger_distance = 1.5
+        self.grasp_approach_distance = 0.26
+        self.arm_stabilization_time = 2.0
+        self.gripper_stabilization_time = 1.0
+        self.gripper_open_pos = 0.05
+        self.gripper_close_pos = 0.025
+        self.angle_tolerance = 0.05
+        self.position_tolerance = 0.15
+        self.angular_kp = 5.0
+        self.max_angular_vel = 2.0
         
-        # 夹爪位置 - test.py验证参数
-        self.gripper_open_pos = 0.05     # 张开位置
-        self.gripper_close_pos = 0.025   # 闭合位置
-        
-        # 优化：角度和距离控制参数
-        self.angle_tolerance = 0.05      # 角度容差，从原来的0.2减小到0.05，更精确
-        self.position_tolerance = 0.15   # 位置容差，从原来的0.2减小到0.15
-        self.angular_kp = 5.0            # 角速度控制增益，从原来的4.0增加到5.0
-        self.max_angular_vel = 2.0       # 最大角速度，从原来的1.5增加到2.0
-        
-        # 抓取状态
         self.carrying_object = None
         self.return_position = None
-        
-        print("真实Franka机械臂抓取系统初始化完成 - 60步插帧丝滑移动")
-        print(f"抓取触发距离: {self.grasp_trigger_distance}m")
-        print(f"抓取接近距离: {self.grasp_approach_distance}m")
-        print(f"机械臂60步插帧丝滑移动: 稳定无晃动")
-        print(f"夹爪60步插帧丝滑移动: 稳定无晃动")
-        print(f"夹爪张开/闭合位置: {self.gripper_open_pos}m / {self.gripper_close_pos}m")
-        print(f"优化：KLT接近距离调整为: {self.klt_approach_distance}m")
-        print(f"优化：角度容差调整为: {self.angle_tolerance}rad")
-        print(f"优化：角速度增益调整为: {self.angular_kp}")
-        print(f"优化：最大角速度调整为: {self.max_angular_vel}rad/s")
     
     def initialize_system(self):
         """初始化系统"""
@@ -1478,6 +1426,8 @@ class FourObjectCoverageSystem:
 
 def main():
     """主函数"""
+    from data_structures import ROBOT_RADIUS, SAFETY_MARGIN, INTERACTION_DISTANCE, FINE_GRID_SIZE, COVERAGE_MARK_RADIUS, MARK_DISTANCE_THRESHOLD, COVERAGE_UPDATE_FREQUENCY
+    
     print("KLT框子任务区域版机器人覆盖系统 + 激光雷达实时避障 + 真实Franka机械臂抓取")
     print(f"机器人半径: {ROBOT_RADIUS}m")
     print(f"安全边距: {SAFETY_MARGIN}m") 

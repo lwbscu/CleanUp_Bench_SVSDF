@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 路径规划模块
-包含四类对象路径规划器，实现高效弓字形避障算法
 """
 
 import numpy as np
@@ -10,7 +9,7 @@ from typing import List, Tuple, Optional
 from data_structures import *
 
 class FourObjectPathPlanner:
-    """四类对象路径规划器 - 高效弓字形避障优化版"""
+    """四类对象路径规划器"""
     
     def __init__(self):
         self.world_size = COVERAGE_AREA_SIZE
@@ -18,43 +17,31 @@ class FourObjectPathPlanner:
         self.grid_size = int(self.world_size / self.cell_size)
         self.robot_radius = ROBOT_RADIUS
         self.safety_margin = SAFETY_MARGIN
-        
-        # 高分辨率障碍地图用于精确路径检查
-        self.fine_grid_size = self.grid_size * 4  # 4倍精度
+        self.fine_grid_size = self.grid_size * 4
         self.fine_cell_size = self.world_size / self.fine_grid_size
-        
         self.obstacle_map = np.zeros((self.grid_size, self.grid_size), dtype=bool)
         self.fine_obstacle_map = np.zeros((self.fine_grid_size, self.fine_grid_size), dtype=bool)
         self.scene_objects = []
         
-        print(f"高效弓字形路径规划器初始化:")
-        print(f"  基础网格: {self.grid_size}x{self.grid_size}")
-        print(f"  精细网格: {self.fine_grid_size}x{self.fine_grid_size}")
-        print(f"  机器人半径: {self.robot_radius}m")
-        print(f"  安全边距: {self.safety_margin}m")
+        print(f"路径规划器初始化完成: 网格{self.grid_size}x{self.grid_size}")
     
     def add_scene_object(self, scene_obj: SceneObject):
         """添加场景对象"""
         self.scene_objects.append(scene_obj)
         
-        # 只有障碍物需要加入碰撞地图用于路径规划避障
         if scene_obj.object_type == ObjectType.OBSTACLE:
             self._mark_collision_cells(scene_obj)
-        
-        print(f"添加{scene_obj.object_type.value}对象: {scene_obj.name}")
     
     def _mark_collision_cells(self, scene_obj: SceneObject):
-        """标记碰撞单元格 - 双分辨率标记"""
+        """标记碰撞单元格"""
         boundary = scene_obj.collision_boundary
         center = boundary.center
-        
         expansion = self.robot_radius + self.safety_margin
         
         if boundary.shape_type == 'sphere':
             radius = boundary.dimensions[0] + expansion
             self._mark_circular_area(center, radius, self.obstacle_map, self.grid_size, self.cell_size)
             self._mark_circular_area(center, radius, self.fine_obstacle_map, self.fine_grid_size, self.fine_cell_size)
-        
         elif boundary.shape_type == 'box':
             half_w = boundary.dimensions[0] / 2 + expansion
             half_l = boundary.dimensions[1] / 2 + expansion
@@ -62,7 +49,6 @@ class FourObjectPathPlanner:
                                       self.obstacle_map, self.grid_size, self.cell_size)
             self._mark_rectangular_area(center, half_w, half_l, boundary.rotation,
                                       self.fine_obstacle_map, self.fine_grid_size, self.fine_cell_size)
-        
         elif boundary.shape_type == 'cylinder':
             radius = boundary.dimensions[0] + expansion
             self._mark_circular_area(center, radius, self.obstacle_map, self.grid_size, self.cell_size)
@@ -147,14 +133,14 @@ class FourObjectPathPlanner:
         return False
     
     def generate_coverage_path(self, start_pos: np.ndarray) -> List[CoveragePoint]:
-        """生成高效弓字形覆盖路径"""
-        print("生成高效弓字形覆盖路径...")
-        
+        """生成覆盖路径"""
+        print(f"=== 开始生成覆盖路径 ===")
         coverage_points = self._generate_safe_coverage_grid()
+        print(f"生成了 {len(coverage_points)} 个覆盖点")
         path_points = self._create_efficient_bow_pattern_path(coverage_points, start_pos)
+        print(f"弓形路径包含 {len(path_points)} 个路径点")
         validated_path = self._validate_and_fix_path_connectivity(path_points)
-        
-        print(f"弓字形覆盖路径生成完成: {len(validated_path)}个点")
+        print(f"验证后路径包含 {len(validated_path)} 个路径点")
         return validated_path
     
     def _generate_safe_coverage_grid(self) -> List[Tuple[int, int]]:

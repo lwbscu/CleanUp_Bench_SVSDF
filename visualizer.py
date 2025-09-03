@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 可视化模块
-包含超丝滑流畅覆盖可视化器和真实移动可视化器
 """
 
 import numpy as np
@@ -9,7 +8,7 @@ from typing import List
 from data_structures import *
 
 class FluentCoverageVisualizer:
-    """超丝滑流畅覆盖区域可视化器 - 无延迟实时跟踪机器人移动"""
+    """流畅覆盖区域可视化器"""
     
     def __init__(self, world):
         from pxr import UsdLux, UsdPhysics, Gf, UsdGeom, UsdShade, Sdf
@@ -19,135 +18,77 @@ class FluentCoverageVisualizer:
         self.Gf = Gf
         
         self.world = world
-        self.coverage_marks = {}  # 精细位置 -> 覆盖次数
-        self.mark_prims = {}      # 精细位置 -> prim路径
+        self.coverage_marks = {}
+        self.mark_prims = {}
         self.coverage_container = "/World/CoverageMarks"
         self.last_marked_position = None
         self.mark_counter = 0
-        
-        print(f"超丝滑流畅覆盖可视化器初始化 - 网格精度: {FINE_GRID_SIZE}m, 智能物理距离分散")
     
     def mark_coverage_realtime(self, robot_position: np.ndarray):
-        """超丝滑实时标记 - 基于物理距离智能分散"""
+        """实时标记"""
         self.mark_counter += 1
-        
-        # 使用超精细网格进行丝滑标记
         fine_grid_pos = self._ultra_fine_quantize_position(robot_position)
         
-        # 改进的标记策略 - 基于物理距离智能分散
         if self._should_create_intelligent_dispersed_mark(fine_grid_pos):
             self._create_ultra_smooth_coverage_mark(fine_grid_pos)
             self.last_marked_position = fine_grid_pos.copy()
     
     def _should_create_intelligent_dispersed_mark(self, current_pos: np.ndarray) -> bool:
-        """智能判断是否应该创建新标记 - 基于物理距离分散算法"""
+        """判断是否应该创建新标记"""
         if self.last_marked_position is None:
             return True
         
-        # 计算与上一个标记的距离
+        from data_structures import MARK_DISTANCE_THRESHOLD
         distance_to_last = np.linalg.norm(current_pos[:2] - self.last_marked_position[:2])
-        
-        # 基础距离阈值检查
-        if distance_to_last < MARK_DISTANCE_THRESHOLD:
-            return False
-        
-        # 智能分散检查：避免在密集区域创建过多标记
-        nearby_mark_count = self._count_nearby_marks(current_pos, radius=0.5)  # 0.5米范围内
-        
-        # 如果附近标记较少，更容易创建新标记
-        if nearby_mark_count < 3:
-            return True
-        
-        # 如果附近标记较多，需要更大的距离间隔
-        adaptive_threshold = MARK_DISTANCE_THRESHOLD * (1 + nearby_mark_count * 0.3)
-        
-        return distance_to_last >= adaptive_threshold
-    
-    def _count_nearby_marks(self, position: np.ndarray, radius: float) -> int:
-        """计算指定半径内的标记数量"""
-        count = 0
-        pos_2d = position[:2]
-        
-        for pos_key in self.coverage_marks:
-            # 从位置键解析坐标
-            try:
-                parts = pos_key.split('_')
-                if len(parts) >= 2:
-                    x_str = parts[0].replace('N', '-').replace('p', '.')
-                    y_str = parts[1].replace('N', '-').replace('p', '.')
-                    mark_pos = np.array([float(x_str), float(y_str)])
-                    
-                    distance = np.linalg.norm(pos_2d - mark_pos)
-                    if distance <= radius:
-                        count += 1
-            except:
-                continue
-        
-        return count
+        return bool(distance_to_last >= MARK_DISTANCE_THRESHOLD)
     
     def _ultra_fine_quantize_position(self, position: np.ndarray) -> np.ndarray:
-        """超精细量化位置 - 极小网格实现超丝滑效果"""
-        # 使用极精细网格，确保标记无缝连接
+        """量化位置"""
+        from data_structures import FINE_GRID_SIZE
         x = round(position[0] / FINE_GRID_SIZE) * FINE_GRID_SIZE
         y = round(position[1] / FINE_GRID_SIZE) * FINE_GRID_SIZE
-        return np.array([x, y, 0.015])  # 更贴近地面
+        return np.array([x, y, 0.015])
     
     def _create_ultra_smooth_coverage_mark(self, position: np.ndarray):
-        """创建超丝滑的覆盖标记"""
+        """创建覆盖标记"""
         stage = self.world.stage
         
-        # 确保容器存在
         if not stage.GetPrimAtPath(self.coverage_container):
             stage.DefinePrim(self.coverage_container, "Xform")
         
-        # 创建唯一标记路径
         mark_id = len(self.coverage_marks)
         x_str = f"{position[0]:.3f}".replace(".", "p").replace("-", "N")
         y_str = f"{position[1]:.3f}".replace(".", "p").replace("-", "N")
         pos_key = f"{x_str}_{y_str}"
         mark_path = f"{self.coverage_container}/SmoothMark_{mark_id}_{pos_key}"
         
-        # 记录覆盖
         if pos_key in self.coverage_marks:
             self.coverage_marks[pos_key] += 1
-            return  # 已存在，避免重复
+            return
         else:
             self.coverage_marks[pos_key] = 1
         
         coverage_count = self.coverage_marks[pos_key]
         
-        # 创建超小圆形标记
         mark_prim = stage.DefinePrim(mark_path, "Cylinder")
         cylinder_geom = self.UsdGeom.Cylinder(mark_prim)
         
-        # 更小的标记半径，更精细的跟踪
-        mark_radius = COVERAGE_MARK_RADIUS * 0.7  # 进一步减小
+        from data_structures import COVERAGE_MARK_RADIUS
+        mark_radius = COVERAGE_MARK_RADIUS * 0.7
         cylinder_geom.CreateRadiusAttr().Set(mark_radius)
-        cylinder_geom.CreateHeightAttr().Set(0.008)  # 更薄
+        cylinder_geom.CreateHeightAttr().Set(0.008)
         
-        # 设置位置
         xform = self.UsdGeom.Xformable(mark_prim)
         xform.ClearXformOpOrder()
         translate_op = xform.AddTranslateOp()
         translate_op.Set(self.Gf.Vec3d(float(position[0]), float(position[1]), float(position[2])))
         
-        # 简单禁用物理
-        try:
-            self.UsdPhysics.RigidBodyAPI.Apply(mark_prim)
-            rigid_body = self.UsdPhysics.RigidBodyAPI(mark_prim)
-            rigid_body.CreateRigidBodyEnabledAttr().Set(False)
-        except:
-            pass
+        self.UsdPhysics.RigidBodyAPI.Apply(mark_prim)
+        rigid_body = self.UsdPhysics.RigidBodyAPI(mark_prim)
+        rigid_body.CreateRigidBodyEnabledAttr().Set(False)
         
-        # 设置5档超精细渐变颜色
         self._set_ultra_smooth_color(mark_prim, coverage_count)
-        
-        # 记录标记
         self.mark_prims[pos_key] = mark_path
-        
-        # 更频繁的进度显示
-        if len(self.coverage_marks) % 50 == 0:
-            print(f"超丝滑覆盖进度: {len(self.coverage_marks)}个超精细标记")
     
     def _set_ultra_smooth_color(self, mark_prim, coverage_count: int):
         """设置5档超精细灰度渐变 - 从极浅灰到深黑"""

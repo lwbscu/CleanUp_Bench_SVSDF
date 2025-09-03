@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-机器人控制模块 - 集成激光雷达避障与超丝滑覆盖标记
-包含机器人移动控制、实时覆盖标记和激光雷达避障功能
+机器人控制模块
 """
 
 import numpy as np
@@ -17,55 +16,38 @@ class FixedRobotController:
         
         self.ArticulationAction = ArticulationAction
         self.R = R
-        
         self.mobile_base = mobile_base
         self.world = world
         self.max_linear_vel = MAX_LINEAR_VELOCITY
         self.max_angular_vel = MAX_ANGULAR_VELOCITY
-        
-        # 控制参数
         self.linear_kp = 3.0
         self.angular_kp = 4.0
-        
-        # 速度平滑
         self.prev_linear = 0.0
         self.prev_angular = 0.0
         self.smooth_factor = 0.8
-        
-        # 覆盖可视化器引用 - 用于超丝滑标记
         self.coverage_visualizer = None
-        
-        # 激光雷达避障控制器 - 新增
         self.lidar_avoidance = None
         self.dynamic_replanner = None
-        
-        # 路径跟踪状态
         self.current_path = []
         self.current_path_index = 0
         self.path_blocked_counter = 0
         self.emergency_path = []
         self.using_emergency_path = False
-        
-        print("集成激光雷达避障的机器人控制器初始化")
-        print(f"线速度上限: {self.max_linear_vel}m/s")
-        print(f"角速度上限: {self.max_angular_vel}rad/s")
     
     def set_coverage_visualizer(self, visualizer):
         """设置覆盖可视化器引用"""
         self.coverage_visualizer = visualizer
     
     def set_lidar_avoidance(self, lidar_avoidance_controller, dynamic_replanner=None):
-        """设置激光雷达避障控制器 - 新增方法"""
+        """设置激光雷达避障控制器"""
         self.lidar_avoidance = lidar_avoidance_controller
         self.dynamic_replanner = dynamic_replanner
-        print("激光雷达避障控制器已集成")
     
     def set_coverage_path(self, path_points):
-        """设置覆盖路径 - 新增方法"""
+        """设置覆盖路径"""
         self.current_path = path_points
         self.current_path_index = 0
         self.using_emergency_path = False
-        print(f"设置覆盖路径: {len(path_points)}个点")
     
     def move_to_position_robust(self, target_pos: np.ndarray, target_orientation: float = 0.0) -> bool:
         """鲁棒的移动到位置方法 - 集成激光雷达避障"""
@@ -497,7 +479,7 @@ class FixedRobotController:
                       distance_score * 0.3 + 
                       safety_score * 0.2)
         
-        return total_score
+        return float(total_score)
     
     def _compute_and_send_control_with_avoidance(self, current_pos: np.ndarray, current_yaw: float, 
                                                target_pos: np.ndarray, target_yaw: float):
@@ -526,13 +508,13 @@ class FixedRobotController:
             angular_vel = np.clip(self.angular_kp * yaw_error * 0.5, 
                                 -self.max_angular_vel, self.max_angular_vel)
         
-        # 激光雷达避障调整 - 新增
+        # 激光雷达避障调整
         if self.lidar_avoidance:
             linear_vel, angular_vel = self.lidar_avoidance.get_avoidance_velocity_adjustment(linear_vel, angular_vel)
         
         # 平滑速度变化
-        linear_vel = self._smooth_velocity(linear_vel, self.prev_linear)
-        angular_vel = self._smooth_velocity(angular_vel, self.prev_angular)
+        linear_vel = self._smooth_velocity(float(linear_vel), self.prev_linear)
+        angular_vel = self._smooth_velocity(float(angular_vel), self.prev_angular)
         
         self.prev_linear = linear_vel
         self.prev_angular = angular_vel
