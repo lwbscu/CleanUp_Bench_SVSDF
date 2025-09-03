@@ -25,28 +25,65 @@ class FluentCoverageVisualizer:
         self.last_marked_position = None
         self.mark_counter = 0
         
-        print(f"超丝滑流畅覆盖可视化器初始化 - 网格精度: {FINE_GRID_SIZE}m")
+        print(f"超丝滑流畅覆盖可视化器初始化 - 网格精度: {FINE_GRID_SIZE}m, 智能物理距离分散")
     
     def mark_coverage_realtime(self, robot_position: np.ndarray):
-        """超丝滑实时标记 - 每次机器人移动都可能创建标记"""
+        """超丝滑实时标记 - 基于物理距离智能分散"""
         self.mark_counter += 1
         
         # 使用超精细网格进行丝滑标记
         fine_grid_pos = self._ultra_fine_quantize_position(robot_position)
         
-        # 更激进的标记策略 - 距离很小就创建新标记
-        if self._should_create_ultra_smooth_mark(fine_grid_pos):
+        # 改进的标记策略 - 基于物理距离智能分散
+        if self._should_create_intelligent_dispersed_mark(fine_grid_pos):
             self._create_ultra_smooth_coverage_mark(fine_grid_pos)
             self.last_marked_position = fine_grid_pos.copy()
     
-    def _should_create_ultra_smooth_mark(self, current_pos: np.ndarray) -> bool:
-        """判断是否应该创建新标记 - 超敏感距离检测"""
+    def _should_create_intelligent_dispersed_mark(self, current_pos: np.ndarray) -> bool:
+        """智能判断是否应该创建新标记 - 基于物理距离分散算法"""
         if self.last_marked_position is None:
             return True
-            
-        # 使用更小的距离阈值，让标记更连贯
-        distance = np.linalg.norm(current_pos[:2] - self.last_marked_position[:2])
-        return distance >= MARK_DISTANCE_THRESHOLD
+        
+        # 计算与上一个标记的距离
+        distance_to_last = np.linalg.norm(current_pos[:2] - self.last_marked_position[:2])
+        
+        # 基础距离阈值检查
+        if distance_to_last < MARK_DISTANCE_THRESHOLD:
+            return False
+        
+        # 智能分散检查：避免在密集区域创建过多标记
+        nearby_mark_count = self._count_nearby_marks(current_pos, radius=0.5)  # 0.5米范围内
+        
+        # 如果附近标记较少，更容易创建新标记
+        if nearby_mark_count < 3:
+            return True
+        
+        # 如果附近标记较多，需要更大的距离间隔
+        adaptive_threshold = MARK_DISTANCE_THRESHOLD * (1 + nearby_mark_count * 0.3)
+        
+        return distance_to_last >= adaptive_threshold
+    
+    def _count_nearby_marks(self, position: np.ndarray, radius: float) -> int:
+        """计算指定半径内的标记数量"""
+        count = 0
+        pos_2d = position[:2]
+        
+        for pos_key in self.coverage_marks:
+            # 从位置键解析坐标
+            try:
+                parts = pos_key.split('_')
+                if len(parts) >= 2:
+                    x_str = parts[0].replace('N', '-').replace('p', '.')
+                    y_str = parts[1].replace('N', '-').replace('p', '.')
+                    mark_pos = np.array([float(x_str), float(y_str)])
+                    
+                    distance = np.linalg.norm(pos_2d - mark_pos)
+                    if distance <= radius:
+                        count += 1
+            except:
+                continue
+        
+        return count
     
     def _ultra_fine_quantize_position(self, position: np.ndarray) -> np.ndarray:
         """超精细量化位置 - 极小网格实现超丝滑效果"""
@@ -172,7 +209,7 @@ class RealMovementVisualizer:
         # 集成超丝滑流畅覆盖可视化器
         self.fluent_coverage_visualizer = FluentCoverageVisualizer(world)
         
-        print("初始化真实移动可视化器（集成超丝滑覆盖）")
+        print("初始化真实移动可视化器（集成超丝滑覆盖 + 智能物理距离分散）")
     
     def setup_complete_path_visualization(self, path_points: List[CoveragePoint]):
         """设置完整路径可视化 - 优化版，避免线条贯穿障碍物"""
@@ -263,11 +300,13 @@ class RealMovementVisualizer:
         return True
     
     def _create_ghost_robots(self):
-        """创建虚影机器人"""
+        """创建虚影机器人 - 基于物理距离智能分散"""
         self.stage.DefinePrim(self.ghost_container, "Xform")
         
-        # 选择关键位置放置虚影机器人
+        # 选择关键位置放置虚影机器人 - 使用智能分散算法
         ghost_indices = self._select_ghost_positions()
+        
+        print(f"    创建智能分散虚影机器人...")
         
         for i, point_idx in enumerate(ghost_indices):
             point = self.all_path_points[point_idx]
@@ -299,42 +338,121 @@ class RealMovementVisualizer:
             self._set_ghost_material(ghost_prim, 0.4)
             
             self.ghost_robots.append(ghost_path)
+            
+            print(f"      虚影{i+1}: 位置[{point.position[0]:.2f}, {point.position[1]:.2f}], 朝向{yaw_degrees:.1f}°")
         
-        print(f"创建虚影机器人: {len(ghost_indices)}个")
+        print(f"    智能分散虚影机器人创建完成: {len(ghost_indices)}个, 物理距离优化分布")
     
     def _select_ghost_positions(self) -> List[int]:
-        """智能选择虚影位置"""
+        """智能选择虚影位置 - 基于物理距离分散算法"""
         total_points = len(self.all_path_points)
         max_ghosts = min(MAX_GHOST_ROBOTS, total_points)
         
         if total_points <= max_ghosts:
             return list(range(total_points))
         
+        print(f"    开始智能物理距离分散算法: {total_points}个路径点，目标{max_ghosts}个虚影")
+        
         selected_indices = []
         
-        # 必须包含起点和终点
+        # 1. 必须包含起点和终点
         selected_indices.append(0)
         if total_points > 1:
             selected_indices.append(total_points - 1)
         
-        # 优先选择有物体的点
-        object_indices = [i for i, p in enumerate(self.all_path_points) if p.has_object]
-        for idx in object_indices[:max_ghosts//2]:
-            if idx not in selected_indices:
-                selected_indices.append(idx)
-        
-        # 均匀选择其他点
+        # 2. 使用贪心算法选择物理距离最分散的点
+        min_distance_threshold = 2.0  # 最小间距阈值(米)
         remaining_slots = max_ghosts - len(selected_indices)
-        if remaining_slots > 0:
-            step = max(1, total_points // remaining_slots)
+        
+        # 候选点池：排除已选择的起点和终点
+        candidate_indices = [i for i in range(1, total_points - 1)]
+        
+        for slot in range(remaining_slots):
+            if not candidate_indices:
+                break
             
-            for i in range(step, total_points, step):
+            best_candidate = None
+            best_min_distance = 0
+            
+            # 对每个候选点，计算它到已选点的最小距离
+            for candidate_idx in candidate_indices:
+                candidate_pos = self.all_path_points[candidate_idx].position
+                
+                # 计算到所有已选点的最小距离
+                min_distance_to_selected = float('inf')
+                for selected_idx in selected_indices:
+                    selected_pos = self.all_path_points[selected_idx].position
+                    distance = np.linalg.norm(candidate_pos[:2] - selected_pos[:2])
+                    min_distance_to_selected = min(min_distance_to_selected, distance)
+                
+                # 选择与已选点距离最远的候选点
+                if min_distance_to_selected > best_min_distance:
+                    best_min_distance = min_distance_to_selected
+                    best_candidate = candidate_idx
+            
+            if best_candidate is not None:
+                selected_indices.append(best_candidate)
+                candidate_indices.remove(best_candidate)
+                print(f"      选择虚影点 {len(selected_indices)}/{max_ghosts}: 索引{best_candidate}, 最小间距{best_min_distance:.2f}m")
+            else:
+                break
+        
+        # 3. 如果还有空位，优先选择有物体交互的点（但要满足距离约束）
+        if len(selected_indices) < max_ghosts:
+            object_indices = [i for i, p in enumerate(self.all_path_points) if p.has_object and i not in selected_indices]
+            
+            for obj_idx in object_indices:
                 if len(selected_indices) >= max_ghosts:
                     break
-                if i not in selected_indices:
-                    selected_indices.append(i)
+                
+                obj_pos = self.all_path_points[obj_idx].position
+                
+                # 检查是否满足最小距离约束
+                min_distance_to_selected = float('inf')
+                for selected_idx in selected_indices:
+                    selected_pos = self.all_path_points[selected_idx].position
+                    distance = np.linalg.norm(obj_pos[:2] - selected_pos[:2])
+                    min_distance_to_selected = min(min_distance_to_selected, distance)
+                
+                if min_distance_to_selected >= min_distance_threshold * 0.7:  # 对物体点放宽约束
+                    selected_indices.append(obj_idx)
+                    print(f"      额外选择物体交互点: 索引{obj_idx}, 间距{min_distance_to_selected:.2f}m")
         
-        return sorted(selected_indices)
+        # 4. 验证分散效果
+        selected_indices_sorted = sorted(selected_indices)
+        print(f"    物理距离分散验证:")
+        for i, idx in enumerate(selected_indices_sorted):
+            pos = self.all_path_points[idx].position
+            print(f"      虚影{i+1}: 索引{idx}, 位置[{pos[0]:.2f}, {pos[1]:.2f}]")
+        
+        # 计算平均间距
+        if len(selected_indices_sorted) > 1:
+            total_distance = 0
+            distance_count = 0
+            for i in range(len(selected_indices_sorted)):
+                for j in range(i+1, len(selected_indices_sorted)):
+                    pos1 = self.all_path_points[selected_indices_sorted[i]].position
+                    pos2 = self.all_path_points[selected_indices_sorted[j]].position
+                    distance = np.linalg.norm(pos1[:2] - pos2[:2])
+                    total_distance += distance
+                    distance_count += 1
+            
+            avg_distance = total_distance / distance_count if distance_count > 0 else 0
+            print(f"    平均虚影间距: {avg_distance:.2f}m")
+            
+            # 找出最小间距
+            min_distance = float('inf')
+            for i in range(len(selected_indices_sorted)):
+                for j in range(i+1, len(selected_indices_sorted)):
+                    pos1 = self.all_path_points[selected_indices_sorted[i]].position
+                    pos2 = self.all_path_points[selected_indices_sorted[j]].position
+                    distance = np.linalg.norm(pos1[:2] - pos2[:2])
+                    min_distance = min(min_distance, distance)
+            print(f"    最小虚影间距: {min_distance:.2f}m")
+        
+        print(f"    智能物理距离分散完成: 选择{len(selected_indices_sorted)}个虚影点")
+        
+        return selected_indices_sorted
     
     def mark_coverage_realtime(self, robot_position: np.ndarray, step_count: int):
         """超丝滑实时标记覆盖区域 - 无延迟标记"""

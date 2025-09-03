@@ -807,6 +807,11 @@ class FourObjectCoverageSystem:
         """处理抓取对象 - 真实Franka机械臂抓取 - 使用test.py验证参数"""
         print(f"      检测到抓取对象: {grasp_obj.name}")
         
+        # 新增：检查是否已经抓取失败过，如果是则跳过
+        if hasattr(grasp_obj, 'grasp_failed') and grasp_obj.grasp_failed:
+            print(f"      物体 {grasp_obj.name} 之前抓取失败（已变灰色），跳过不再尝试")
+            return
+        
         # 如果已经在运送其他物体，跳过
         if self.carrying_object is not None:
             print(f"      已在运送物体，跳过")
@@ -876,6 +881,42 @@ class FourObjectCoverageSystem:
         else:
             print(f"          ✗ 抓取失败! Z轴抬升 {z_change:.3f}m < {success_threshold}m")
             return False
+    
+    def _set_object_to_gray(self, grasp_obj: SceneObject):
+        """将抓取失败的物体设置为灰色"""
+        try:
+            print(f"          将物体 {grasp_obj.name} 设置为灰色...")
+            
+            if hasattr(grasp_obj, 'isaac_object') and grasp_obj.isaac_object:
+                # 尝试设置物体为灰色
+                from pxr import UsdGeom
+                
+                # 获取物体的prim
+                if hasattr(grasp_obj.isaac_object, 'prim_path'):
+                    stage = self.world.stage
+                    prim_path = grasp_obj.isaac_object.prim_path
+                    prim = stage.GetPrimAtPath(prim_path)
+                    
+                    if prim and prim.IsValid():
+                        # 设置显示颜色为灰色
+                        gprim = UsdGeom.Gprim(prim)
+                        if gprim:
+                            gray_color = (0.5, 0.5, 0.5)  # 灰色
+                            gprim.CreateDisplayColorAttr().Set([gray_color])
+                            print(f"          ✓ 物体 {grasp_obj.name} 已设置为灰色")
+                        else:
+                            print(f"          ⚠ 无法获取物体 {grasp_obj.name} 的Gprim，使用备用方法")
+                    else:
+                        print(f"          ⚠ 物体 {grasp_obj.name} 的prim无效，跳过颜色设置")
+                else:
+                    print(f"          ⚠ 物体 {grasp_obj.name} 没有prim_path属性")
+            
+            # 更新物体的颜色属性（用于记录）
+            grasp_obj.color = np.array([0.5, 0.5, 0.5])
+            
+        except Exception as e:
+            print(f"          ⚠ 设置物体颜色时出错: {e}")
+            print(f"          物体 {grasp_obj.name} 仍被标记为抓取失败，但颜色可能未改变")
 
     def _execute_full_grasp_sequence_with_test_params(self, grasp_obj: SceneObject):
         """执行完整抓取序列 - 60步插帧丝滑移动 + 抓取成功检测"""
@@ -907,10 +948,23 @@ class FourObjectCoverageSystem:
             print(f"        ✓ Franka机械臂抓取成功! 物体已被抬起")
             return True
         else:
-            # 抓取失败，回到home位置，不继续运送
-            print(f"        ✗ 抓取失败! 物体未被成功抬起，取消运送任务")
-            self.coverage_stats['failed_grasps'] += 1  # 统计抓取失败次数
+            # 抓取失败，标记物体为不再尝试，回到home位置
+            print(f"        ✗ 抓取失败! 物体未被成功抓起，取消运送任务")
+            print(f"        ✗ 将物体 {grasp_obj.name} 标记为不再尝试抓取")
+            
+            # 标记物体为抓取失败，不再尝试
+            grasp_obj.grasp_failed = True
+            
+            # 将物体变为灰色，表示抓取失败
+            self._set_object_to_gray(grasp_obj)
+            
+            # 统计抓取失败次数
+            self.coverage_stats['failed_grasps'] += 1
+            
+            # 机械臂回到home位置
             self._move_arm_to_pose("home")
+            
+            print(f"        物体 {grasp_obj.name} 已变为灰色并被永久跳过，机器人将继续覆盖任务")
             return False
     
     def _position_for_grasp_precise(self, grasp_obj: SceneObject):
@@ -1334,7 +1388,9 @@ class FourObjectCoverageSystem:
         print(f"抓取成功检测机制:")
         print(f"  检测方法: Z轴坐标变化检测")
         print(f"  成功阈值: Z轴抬升 >= 0.2m")
-        print(f"  失败处理: 取消运送，继续覆盖任务")
+        print(f"  失败处理: 标记物体不再尝试，继续覆盖任务")
+        print(f"  视觉标记: 失败物体变为灰色")
+        print(f"  智能跳过: 避免重复尝试失败物体")
         
         # 新增：激光雷达避障统计
         if self.lidar_avoidance:
@@ -1440,13 +1496,14 @@ def main():
     print("  距离判断到达")
     print("  框内物体掉落投放")
     print("")
-    print("真实Franka机械臂抓取特性 (60步插帧丝滑移动):")
+    print("真实Franka机械臂抓取特性 (60步插帧丝滑移动 + 智能跳过失败物体):")
     print("  7-DOF精确关节控制")
     print("  60步插帧丝滑移动")
     print("  真实物理夹爪操作")
     print("  消除机器人前后晃动")
     print("  智能抓取成功检测(Z轴坐标变化)")
     print("  抓取失败自动处理")
+    print("  智能跳过失败物体，避免重复尝试")
     print("  完整抓取-运送-释放流程")
     print("")
     print("优化特性:")
