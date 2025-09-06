@@ -253,7 +253,7 @@ class MapExBridgeNode:
                     },
                     'exploration_params': {
                         'max_linear_velocity': 0.3,
-                        'max_angular_velocity': 1.0,
+                        'max_angular_velocity': 2.5,  # 大幅提高角速度从1.0到2.5
                         'exploration_radius': 5.0,
                         'frontier_threshold': 0.1
                     }
@@ -398,8 +398,20 @@ class MapExBridgeNode:
             # 关键修复：更新速度命令时间戳
             self.last_velocity_command_time = time.time()
             
-            # 强制输出所有速度命令（包括零速度）
-            print(f"🚀 MapEx速度命令: linear={twist.linear.x:.3f}, angular={twist.angular.z:.3f}")
+            # 强制输出所有速度命令（包括零速度）- 降低频率，渐进式角速度标识
+            current_time = time.time()
+            if not hasattr(self, 'last_velocity_debug_time') or current_time - self.last_velocity_debug_time > 2.0:
+                # 关键修复：根据角速度大小分级显示
+                abs_angular = abs(twist.angular.z)
+                if abs_angular > 1.5:
+                    print(f"🚀 MapEx高角速度命令: linear={twist.linear.x:.3f}, angular={twist.angular.z:.3f} (⚡快速转弯)")
+                elif abs_angular > 0.8:
+                    print(f"🚀 MapEx中角速度命令: linear={twist.linear.x:.3f}, angular={twist.angular.z:.3f} (🔄中速转弯)")
+                elif abs_angular > 0.1:
+                    print(f"🚀 MapEx低角速度命令: linear={twist.linear.x:.3f}, angular={twist.angular.z:.3f} (🎯微调)")
+                else:
+                    print(f"🚀 MapEx速度命令: linear={twist.linear.x:.3f}, angular={twist.angular.z:.3f}")
+                self.last_velocity_debug_time = current_time
             
         elif cmd_type == 'exploration_status':
             # 发布探索状态
@@ -460,15 +472,16 @@ class MapExBridgeNode:
             if success:
                 self.last_map_send_time = current_time
         
-        # 关键修复：降低位姿发送频率
-        if current_time - getattr(self, 'last_pose_send_time', 0) > 0.2:  # 5Hz发送位姿
+        # 关键修复：降低位姿发送频率，但确保数据精度
+        if current_time - getattr(self, 'last_pose_send_time', 0) > 0.1:  # 10Hz发送位姿，提高频率
             pose_message = {
                 'type': 'robot_pose',
                 'data': {
-                    'x': self.robot_pose[0],
-                    'y': self.robot_pose[1],
-                    'yaw': self.robot_pose[2]
-                }
+                    'x': float(self.robot_pose[0]),  # 确保精度
+                    'y': float(self.robot_pose[1]),
+                    'yaw': float(self.robot_pose[2])
+                },
+                'timestamp': current_time  # 添加时间戳
             }
             success = self._send_to_mapex(pose_message)
             if success:
@@ -525,8 +538,9 @@ class MapExBridgeNode:
             print(f"地图更新计数: {self.map_received_count}, 已知区域: {known_ratio:.1%}")
     
     def robot_pose_callback(self, msg: Float32MultiArray):
-        """机器人位姿回调"""
+        """机器人位姿回调 - 增强调试版本"""
         if len(msg.data) >= 3:
+            old_pose = self.robot_pose.copy()
             self.robot_pose = [msg.data[0], msg.data[1], msg.data[2]]
             self.pose_received_count += 1
             
@@ -535,9 +549,20 @@ class MapExBridgeNode:
                 self.auto_start_conditions['pose_received'] = True
                 print(f"首次收到机器人位姿: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
             
-            # 定期状态报告
-            if self.pose_received_count % 20 == 0:
-                print(f"位姿更新计数: {self.pose_received_count}")
+            # 位姿变化检测和调试输出 - 降低频率
+            current_time = time.time()
+            if (abs(old_pose[0] - self.robot_pose[0]) > 0.01 or 
+                abs(old_pose[1] - self.robot_pose[1]) > 0.01 or 
+                abs(old_pose[2] - self.robot_pose[2]) > 0.1):
+                
+                # 限制输出频率：每3秒最多输出一次位姿变化
+                if not hasattr(self, 'last_pose_debug_time') or current_time - self.last_pose_debug_time > 3.0:
+                    print(f"🔄 桥接节点位姿变化: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
+                    self.last_pose_debug_time = current_time
+            
+            # 定期状态报告 - 每100次更新报告一次，降低频率
+            if self.pose_received_count % 100 == 0:  # 降低频率到每100次
+                print(f"位姿更新计数: {self.pose_received_count}, 当前位姿: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
     
     def lidar_callback(self, msg: PointCloud2):
         """激光雷达数据回调"""

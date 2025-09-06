@@ -309,9 +309,11 @@ class IsaacSimROSBridge:
         }
         self.queue_message(velocity_message)
         
-        # 调试输出（仅在有非零速度时）
-        if abs(msg.linear.x) > 0.01 or abs(msg.angular.z) > 0.01:
-            print(f"MapEx速度命令: linear={msg.linear.x:.3f}, angular={msg.angular.z:.3f}")
+        # 强制输出所有速度命令（包括零速度）- 降低频率
+        current_time = rospy.Time.now()
+        if not hasattr(self, 'last_velocity_debug_time') or (current_time - self.last_velocity_debug_time).to_sec() > 2.0:
+            print(f"🚀 MapEx速度命令: linear={msg.linear.x:.3f}, angular={msg.angular.z:.3f}")
+            self.last_velocity_debug_time = current_time
     
     def exploration_done_callback(self, msg: Bool):
         """探索完成回调"""
