@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SLAM版本机器人控制模块 - 集成MapEx导航和Cartographer SLAM
+修复版本机器人控制器 - 确保位姿正确发布到ROS
 """
 
 import numpy as np
@@ -38,95 +38,24 @@ class SLAMRobotController:
         self.mapex_interface = ros_bridge.get_mapex_interface()
         self.cartographer_interface = ros_bridge.get_cartographer_interface()
         
-        # MapEx命令发布器
-        self.mapex_cmd_pub = rospy.Publisher('/mapex/robot_cmd', Twist, queue_size=10)
-        
         # 导航状态
-        self.navigation_timeout = 30.0  # MapEx导航超时
-        self.position_tolerance = 0.3   # MapEx导航位置容差
+        self.navigation_timeout = 30.0
+        self.position_tolerance = 0.3
         self.mapex_active = False
         
+        # 关键修复：位姿发布配置
+        self.last_pose_publish_time = time.time()
+        self.pose_publish_interval = 0.1  # 10Hz发布频率
+        
         print("SLAM机器人控制器初始化完成")
-        print("MapEx导航接口已连接")
-        print("Cartographer SLAM接口已连接")
+        print("位姿发布已启用：10Hz频率")
     
     def set_coverage_visualizer(self, visualizer):
         """设置覆盖可视化器引用"""
         self.coverage_visualizer = visualizer
     
-    def move_to_position_with_mapex(self, target_pos: np.ndarray, target_orientation: float = 0.0) -> bool:
-        """使用MapEx导航到目标位置"""
-        print(f"MapEx导航到: [{target_pos[0]:.3f}, {target_pos[1]:.3f}]")
-        
-        # 发送目标到MapEx
-        self.mapex_interface.send_goal(target_pos[0], target_pos[1], target_orientation)
-        
-        # 等待MapEx导航完成
-        start_time = time.time()
-        self.mapex_active = True
-        
-        while (time.time() - start_time) < self.navigation_timeout and self.mapex_active:
-            current_pos, _ = self._get_robot_pose()
-            
-            # 超级平滑覆盖标记 - 每步都标记当前位置
-            self._mark_coverage_ultra_smooth(current_pos)
-            
-            # 检查是否到达目标
-            distance_to_target = np.linalg.norm(current_pos[:2] - target_pos[:2])
-            if distance_to_target < self.position_tolerance:
-                self.mapex_active = False
-                print(f"  MapEx导航成功! 误差: {distance_to_target:.3f}m")
-                return True
-            
-            # 获取并执行MapEx的速度命令
-            self._execute_mapex_velocity_commands()
-            
-            # 步进仿真
-            self.world.step(render=True)
-            
-            # 短暂延时
-            time.sleep(0.01)
-        
-        # 导航结束处理
-        self.mapex_active = False
-        if time.time() - start_time >= self.navigation_timeout:
-            print(f"  MapEx导航超时")
-            return False
-        
-        final_pos, _ = self._get_robot_pose()
-        final_error = np.linalg.norm(final_pos[:2] - target_pos[:2])
-        print(f"  MapEx导航完成，最终误差: {final_error:.3f}m")
-        return final_error < self.position_tolerance * 1.5
-    
-    def _execute_mapex_velocity_commands(self):
-        """执行MapEx的速度命令 - 增强版本"""
-        # 从MapEx接口获取速度命令
-        mapex_velocity = self.mapex_interface.mapex_velocity
-        
-        linear_vel = float(mapex_velocity.linear.x)
-        angular_vel = float(mapex_velocity.angular.z)
-        
-        # 限制速度范围
-        linear_vel = np.clip(linear_vel, -self.max_linear_vel, self.max_linear_vel)
-        angular_vel = np.clip(angular_vel, -self.max_angular_vel, self.max_angular_vel)
-        
-        # 平滑速度变化
-        linear_vel = self._smooth_velocity(linear_vel, self.prev_linear)
-        angular_vel = self._smooth_velocity(angular_vel, self.prev_angular)
-        
-        self.prev_linear = linear_vel
-        self.prev_angular = angular_vel
-        
-        # 发送速度指令到机器人
-        self._send_velocity_command(linear_vel, angular_vel)
-        
-        # 调试：显示接收到的原始指令
-        if abs(mapex_velocity.linear.x) > 0.01 or abs(mapex_velocity.angular.z) > 0.01:
-            print(f"Raw MapEx cmd: lin={mapex_velocity.linear.x:.3f}, ang={mapex_velocity.angular.z:.3f}")
-
-    
     def move_to_position_robust(self, target_pos: np.ndarray, target_orientation: float = 0.0) -> bool:
-        """鲁棒的移动到位置方法 - 备用方案，不使用MapEx"""
+        """鲁棒的移动到位置方法"""
         print(f"直接导航到: [{target_pos[0]:.3f}, {target_pos[1]:.3f}]")
         
         max_steps = MAX_NAVIGATION_STEPS
@@ -139,7 +68,10 @@ class SLAMRobotController:
             current_pos, current_yaw = self._get_robot_pose()
             step_count += 1
             
-            # 超级平滑覆盖标记 - 每步都标记当前位置
+            # 关键修复：每步都发布位姿到ROS
+            self._publish_robot_pose_to_ros(current_pos, current_yaw)
+            
+            # 超级平滑覆盖标记
             self._mark_coverage_ultra_smooth(current_pos)
             
             # 检查是否到达
@@ -166,12 +98,37 @@ class SLAMRobotController:
         final_pos, _ = self._get_robot_pose()
         final_error = np.linalg.norm(final_pos[:2] - target_pos[:2])
         
-        if final_error < POSITION_TOLERANCE * 1.5:
-            print(f"  接近成功! 最终误差: {final_error:.3f}m")
-            return True
-        else:
-            print(f"  导航失败! 最终误差: {final_error:.3f}m, 用时: {step_count}步")
-            return False
+        # 最后再发布一次位姿
+        self._publish_robot_pose_to_ros(final_pos, self._get_robot_pose()[1])
+        
+        return final_error < POSITION_TOLERANCE * 1.5
+    
+    def _publish_robot_pose_to_ros(self, position: np.ndarray, yaw: float):
+        """关键修复：发布机器人位姿到ROS系统"""
+        current_time = time.time()
+        
+        # 控制发布频率
+        if current_time - self.last_pose_publish_time < self.pose_publish_interval:
+            return
+        
+        try:
+            # 发送位姿到socket接口
+            if hasattr(self.ros_bridge, 'socket_interface') and self.ros_bridge.socket_interface:
+                success = self.ros_bridge.socket_interface.send_robot_pose(position, yaw)
+                
+                if success:
+                    self.last_pose_publish_time = current_time
+                    
+                    # 定期打印调试信息
+                    if int(current_time) % 5 == 0 and current_time - self.last_pose_publish_time < 0.1:
+                        print(f"位姿发布成功: [{position[0]:.3f}, {position[1]:.3f}], yaw: {np.degrees(yaw):.1f}°")
+                else:
+                    print("位姿发布失败: socket连接问题")
+            else:
+                print("警告: ROS接口未连接，位姿发布跳过")
+                
+        except Exception as e:
+            print(f"发布位姿时出错: {e}")
     
     def _compute_and_send_control(self, current_pos: np.ndarray, current_yaw: float, 
                                  target_pos: np.ndarray, target_yaw: float):
@@ -211,7 +168,7 @@ class SLAMRobotController:
         self._send_velocity_command(linear_vel, angular_vel)
     
     def _mark_coverage_ultra_smooth(self, robot_position: np.ndarray):
-        """超级平滑覆盖标记 - 每步都尝试标记"""
+        """超级平滑覆盖标记"""
         if self.coverage_visualizer and hasattr(self.coverage_visualizer, 'fluent_coverage_visualizer'):
             self.coverage_visualizer.fluent_coverage_visualizer.mark_coverage_realtime(robot_position)
     
@@ -220,7 +177,7 @@ class SLAMRobotController:
         return self.smooth_factor * prev_vel + (1 - self.smooth_factor) * new_vel
     
     def _send_velocity_command(self, linear_vel: float, angular_vel: float):
-        """发送速度指令到轮子 - 增强调试版本"""
+        """发送速度指令到轮子"""
         articulation_controller = self.mobile_base.get_articulation_controller()
         
         # 轮子参数
@@ -248,14 +205,6 @@ class SLAMRobotController:
         # 应用控制指令
         action = self.ArticulationAction(joint_velocities=joint_velocities)
         articulation_controller.apply_action(action)
-        
-        # 调试输出 - 只在非零速度时输出
-        if abs(linear_vel) > 0.01 or abs(angular_vel) > 0.01:
-            print(f"Speed cmd -> Isaac: lin={linear_vel:.3f}, ang={angular_vel:.3f}, "
-                f"left_wheel={left_wheel_vel:.2f}, right_wheel={right_wheel_vel:.2f}")
-            if left_idx is None or right_idx is None:
-                print(f"Warning: 轮子关节未找到. left_idx={left_idx}, right_idx={right_idx}")
-                print(f"Available joints: {self.mobile_base.dof_names}")
     
     def _send_zero_velocity(self):
         """发送零速度指令"""
@@ -295,17 +244,3 @@ class SLAMRobotController:
         self._send_zero_velocity()
         self.mapex_active = False
         print("紧急停止执行")
-    
-    def publish_robot_status_to_ros(self):
-        """发布机器人状态到ROS（供MapEx使用）"""
-        try:
-            # 获取当前位姿
-            position, yaw = self._get_robot_pose()
-            
-            # 可以在这里发布tf变换或其他ROS消息
-            # 让MapEx知道机器人的当前状态
-            
-            pass  # 具体实现取决于MapEx的要求
-            
-        except Exception as e:
-            rospy.logwarn(f"发布机器人状态失败: {e}")

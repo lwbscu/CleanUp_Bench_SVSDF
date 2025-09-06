@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-独立ROS桥接节点 - 运行在Python 3.8环境中
-与Isaac Sim通过socket通信，避免Python版本冲突
+修复版本ROS桥接节点 - 正确的TF发布和位姿处理
 """
 
 import rospy
@@ -10,16 +9,16 @@ import socket
 import threading
 import time
 import numpy as np
-from geometry_msgs.msg import Twist, PoseStamped, Point
+from geometry_msgs.msg import Twist, PoseStamped, Point, TransformStamped
 from nav_msgs.msg import OccupancyGrid, Path
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String, Bool, Float32MultiArray
 from sensor_msgs.msg import LaserScan
 import tf2_ros
 import tf2_geometry_msgs
 from tf_conversions import transformations
 
 class IsaacSimROSBridge:
-    """Isaac Sim ROS桥接节点"""
+    """修复版本的Isaac Sim ROS桥接节点"""
     
     def __init__(self):
         rospy.init_node('isaac_sim_ros_bridge', anonymous=True)
@@ -36,12 +35,16 @@ class IsaacSimROSBridge:
         self.exploration_status_pub = rospy.Publisher('/exploration_status', String, queue_size=10)
         self.isaac_status_pub = rospy.Publisher('/isaac_sim_status', String, queue_size=10)
         
+        # 关键修复：添加机器人位姿发布器
+        self.robot_pose_pub = rospy.Publisher('/robot_pose', Float32MultiArray, queue_size=10)
+        
         # ROS订阅器
         self.map_sub = rospy.Subscriber('/map', OccupancyGrid, self.map_callback, queue_size=1)
         self.mapex_cmd_sub = rospy.Subscriber('/cmd_vel', Twist, self.mapex_cmd_callback, queue_size=10)
         self.exploration_done_sub = rospy.Subscriber('/exploration_done', Bool, self.exploration_done_callback, queue_size=1)
         
-        # TF监听器
+        # 关键修复：TF广播器
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster()
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         
@@ -49,13 +52,19 @@ class IsaacSimROSBridge:
         self.current_map = None
         self.exploration_complete = False
         self.mapex_velocity = Twist()
+        
+        # 关键修复：机器人位姿状态
         self.robot_pose = None
+        self.last_pose_time = rospy.Time.now()
+        self.pose_timeout = 2.0  # 位姿超时阈值
         
         # 消息队列
         self.message_queue = []
         self.queue_lock = threading.Lock()
         
-        print("Isaac Sim ROS桥接节点初始化完成")
+        print("修复版Isaac Sim ROS桥接节点初始化完成")
+        print("TF广播器已启用")
+        print("机器人位姿发布器已启用")
         
     def start_socket_server(self):
         """启动socket服务器"""
@@ -127,8 +136,8 @@ class IsaacSimROSBridge:
         msg_type = message.get('type')
         
         if msg_type == 'robot_pose':
-            # 机器人位姿更新
-            self.robot_pose = message.get('data')
+            # 关键修复：处理机器人位姿更新
+            self.handle_robot_pose_update(message.get('data'))
             
         elif msg_type == 'request_goal':
             # 请求导航目标
@@ -146,6 +155,91 @@ class IsaacSimROSBridge:
                 'type': 'heartbeat_response',
                 'timestamp': time.time()
             })
+    
+    def handle_robot_pose_update(self, pose_data):
+        """关键修复：处理机器人位姿更新"""
+        if not pose_data:
+            return
+            
+        try:
+            # 提取位姿数据
+            position = pose_data.get('position', [0.0, 0.0, 0.0])
+            yaw = pose_data.get('yaw', 0.0)
+            
+            # 数据验证：检查数值是否合理
+            if (abs(position[0]) > 1000 or abs(position[1]) > 1000 or 
+                abs(position[2]) > 1000 or abs(yaw) > 10):
+                print(f"警告: 收到异常位姿数据: pos={position}, yaw={yaw}")
+                return
+            
+            # 更新内部状态
+            self.robot_pose = {
+                'position': position,
+                'yaw': yaw,
+                'timestamp': rospy.Time.now()
+            }
+            self.last_pose_time = rospy.Time.now()
+            
+            # 发布TF变换
+            self.publish_robot_tf(position, yaw)
+            
+            # 发布机器人位姿话题
+            self.publish_robot_pose_topic(position, yaw)
+            
+            # 调试输出（每5秒一次）
+            current_time = rospy.Time.now()
+            if (current_time - getattr(self, 'last_debug_time', rospy.Time(0))).to_sec() > 5.0:
+                print(f"位姿更新: pos=[{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}], yaw={np.degrees(yaw):.1f}°")
+                self.last_debug_time = current_time
+                
+        except Exception as e:
+            print(f"处理位姿更新时出错: {e}")
+    
+    def publish_robot_tf(self, position, yaw):
+        """关键修复：发布正确的TF变换"""
+        try:
+            # 创建TF变换消息
+            t = TransformStamped()
+            
+            # 设置坐标系
+            t.header.stamp = rospy.Time.now()
+            t.header.frame_id = "map"
+            t.child_frame_id = "base_link"
+            
+            # 设置平移（直接使用Isaac Sim的坐标）
+            t.transform.translation.x = float(position[0])
+            t.transform.translation.y = float(position[1])
+            t.transform.translation.z = float(position[2])
+            
+            # 设置旋转（yaw角转四元数）
+            quaternion = transformations.quaternion_from_euler(0, 0, yaw)
+            t.transform.rotation.x = quaternion[0]
+            t.transform.rotation.y = quaternion[1]
+            t.transform.rotation.z = quaternion[2]
+            t.transform.rotation.w = quaternion[3]
+            
+            # 广播TF变换
+            self.tf_broadcaster.sendTransform(t)
+            
+        except Exception as e:
+            print(f"发布TF变换时出错: {e}")
+    
+    def publish_robot_pose_topic(self, position, yaw):
+        """关键修复：发布机器人位姿话题"""
+        try:
+            # 创建位姿消息
+            pose_msg = Float32MultiArray()
+            pose_msg.data = [
+                float(position[0]),  # x
+                float(position[1]),  # y
+                float(yaw)           # yaw
+            ]
+            
+            # 发布位姿
+            self.robot_pose_pub.publish(pose_msg)
+            
+        except Exception as e:
+            print(f"发布位姿话题时出错: {e}")
     
     def queue_message(self, message):
         """将消息加入队列"""
@@ -192,6 +286,14 @@ class IsaacSimROSBridge:
             }
         }
         self.queue_message(map_message)
+        
+        # 定期打印地图状态
+        if not hasattr(self, 'last_map_debug_time'):
+            self.last_map_debug_time = rospy.Time.now()
+        
+        if (rospy.Time.now() - self.last_map_debug_time).to_sec() > 10.0:
+            print(f"地图更新: {width}x{height}, 分辨率: {resolution:.3f}m/cell")
+            self.last_map_debug_time = rospy.Time.now()
     
     def mapex_cmd_callback(self, msg: Twist):
         """MapEx命令回调"""
@@ -206,6 +308,10 @@ class IsaacSimROSBridge:
             }
         }
         self.queue_message(velocity_message)
+        
+        # 调试输出（仅在有非零速度时）
+        if abs(msg.linear.x) > 0.01 or abs(msg.angular.z) > 0.01:
+            print(f"MapEx速度命令: linear={msg.linear.x:.3f}, angular={msg.angular.z:.3f}")
     
     def exploration_done_callback(self, msg: Bool):
         """探索完成回调"""
@@ -217,42 +323,9 @@ class IsaacSimROSBridge:
             'data': msg.data
         }
         self.queue_message(done_message)
-    
-    def get_robot_pose_from_tf(self):
-        """从TF获取机器人位姿"""
-        try:
-            # 获取base_link到map的变换
-            transform = self.tf_buffer.lookup_transform(
-                'map', 'base_link', rospy.Time(), rospy.Duration(1.0))
-            
-            # 提取位置
-            position = [
-                transform.transform.translation.x,
-                transform.transform.translation.y,
-                transform.transform.translation.z
-            ]
-            
-            # 提取航向角
-            quaternion = [
-                transform.transform.rotation.x,
-                transform.transform.rotation.y,
-                transform.transform.rotation.z,
-                transform.transform.rotation.w
-            ]
-            _, _, yaw = transformations.euler_from_quaternion(quaternion)
-            
-            # 发送位姿到Isaac Sim
-            pose_message = {
-                'type': 'robot_pose_tf',
-                'data': {
-                    'position': position,
-                    'yaw': yaw
-                }
-            }
-            self.queue_message(pose_message)
-            
-        except Exception as e:
-            rospy.logdebug(f"无法获取机器人位姿: {e}")
+        
+        if msg.data:
+            print("收到MapEx探索完成信号")
     
     def send_navigation_goal(self, x: float, y: float, yaw: float = 0.0):
         """发送导航目标"""
@@ -263,7 +336,7 @@ class IsaacSimROSBridge:
         goal.pose.position.y = y
         goal.pose.position.z = 0.0
         
-        # 转换偏航角为四元数
+        # 转换航向角为四元数
         quaternion = transformations.quaternion_from_euler(0, 0, yaw)
         goal.pose.orientation.x = quaternion[0]
         goal.pose.orientation.y = quaternion[1]
@@ -278,6 +351,7 @@ class IsaacSimROSBridge:
         msg = String()
         msg.data = status
         self.exploration_status_pub.publish(msg)
+        print(f"探索状态更新: {status}")
     
     def publish_isaac_status(self, status: str):
         """发布Isaac Sim状态"""
@@ -316,6 +390,17 @@ class IsaacSimROSBridge:
             rospy.logerr(f"保存地图时发生异常: {e}")
             return False
     
+    def check_robot_pose_status(self):
+        """检查机器人位姿状态"""
+        if self.robot_pose is None:
+            return "NO_POSE"
+        
+        time_since_last_pose = (rospy.Time.now() - self.last_pose_time).to_sec()
+        if time_since_last_pose > self.pose_timeout:
+            return "POSE_TIMEOUT"
+        
+        return "POSE_OK"
+    
     def run(self):
         """运行ROS桥接节点"""
         # 启动socket服务器线程
@@ -327,8 +412,16 @@ class IsaacSimROSBridge:
         rate = rospy.Rate(30)  # 30Hz
         
         while not rospy.is_shutdown():
-            # 定期更新机器人位姿
-            self.get_robot_pose_from_tf()
+            # 检查机器人位姿状态
+            pose_status = self.check_robot_pose_status()
+            
+            # 定期状态报告
+            if not hasattr(self, 'last_status_time'):
+                self.last_status_time = rospy.Time.now()
+            
+            if (rospy.Time.now() - self.last_status_time).to_sec() > 30.0:
+                print(f"桥接状态: 位姿={pose_status}, 地图={'有' if self.current_map else '无'}, 探索={'完成' if self.exploration_complete else '进行中'}")
+                self.last_status_time = rospy.Time.now()
             
             try:
                 rate.sleep()

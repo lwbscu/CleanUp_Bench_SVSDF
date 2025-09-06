@@ -737,7 +737,7 @@ class CompleteSLAMCoverageSystem:
         self.path_planner.update_slam_map(map_data)
     
     def run_slam_exploration(self):
-        """运行SLAM探索阶段 - 完整三进程版本"""
+        """运行SLAM探索阶段 - 修复版本，确保位姿持续发布"""
         print("\n=== 开始SLAM探索阶段 ===")
         print("Phase 1: 使用Cartographer SLAM + MapEx探索未知环境")
         
@@ -760,19 +760,28 @@ class CompleteSLAMCoverageSystem:
         exploration_steps = 0
         max_exploration_steps = 25000  # 增加最大探索步数
         
-        # 添加ROS速度命令处理
-        last_velocity_time = time.time()
-        velocity_timeout = 2.0  # 2秒速度命令超时
+        # 关键修复：确保位姿持续发布
+        last_pose_publish_time = time.time()
+        pose_publish_interval = 0.1  # 10Hz发布频率
         
         while (not self.slam_complete and 
                exploration_steps < max_exploration_steps and 
                self.current_phase == "SLAM_EXPLORATION"):
             
             # 获取机器人当前位置并标记覆盖
-            current_pos, _ = self.robot_controller._get_robot_pose()
+            current_pos, current_yaw = self.robot_controller._get_robot_pose()
             self.robot_controller._mark_coverage_ultra_smooth(current_pos)
             
-            # 关键修复：处理来自MapEx的ROS速度指令
+            # 关键修复：强制发布位姿到ROS（高频率）
+            current_time = time.time()
+            if current_time - last_pose_publish_time >= pose_publish_interval:
+                self.robot_controller._publish_robot_pose_to_ros(current_pos, current_yaw)
+                last_pose_publish_time = current_time
+                # 调试输出：每500步显示一次位姿发布状态
+                if exploration_steps % 500 == 0:
+                    print(f"强制发布位姿: [{current_pos[0]:.3f}, {current_pos[1]:.3f}], yaw: {np.degrees(current_yaw):.1f}°")
+            
+            # 处理来自MapEx的ROS速度指令
             try:
                 # 检查是否有新的速度指令
                 mapex_velocity = mapex_interface.mapex_velocity
@@ -789,15 +798,18 @@ class CompleteSLAMCoverageSystem:
                         self.robot_controller._send_velocity_command(linear_vel, angular_vel)
                         
                         if exploration_steps % 200 == 0:
-                            print(f"  执行MapEx速度指令: linear={linear_vel:.3f}, angular={angular_vel:.3f}")
+                            print(f"执行MapEx速度指令: linear={linear_vel:.3f}, angular={angular_vel:.3f}")
                     else:
                         # 检查速度指令超时
-                        if (time.time() - last_velocity_time) > velocity_timeout:
+                        if not hasattr(self, 'last_velocity_time'):
+                            self.last_velocity_time = time.time()
+                        
+                        if (time.time() - getattr(self, 'last_velocity_time', time.time())) > 2.0:
                             # 超时则停止机器人
                             self.robot_controller._send_velocity_command(0.0, 0.0)
                 
             except Exception as e:
-                print(f"  处理速度指令时出错: {e}")
+                print(f"处理速度指令时出错: {e}")
                 # 出错时停止机器人
                 self.robot_controller._send_velocity_command(0.0, 0.0)
             
@@ -808,14 +820,19 @@ class CompleteSLAMCoverageSystem:
             # 周期性进度报告
             if exploration_steps % 1000 == 0:
                 elapsed_time = time.time() - self.exploration_start_time
-                print(f"  探索进度: {exploration_steps}/{max_exploration_steps} "
+                print(f"探索进度: {exploration_steps}/{max_exploration_steps} "
                       f"步, 已用时: {elapsed_time:.1f}秒")
                 
                 # 检查是否有地图数据
                 current_map = mapex_interface.get_current_map()
                 if current_map:
-                    print(f"  地图尺寸: {current_map['width']}x{current_map['height']}, "
+                    print(f"地图尺寸: {current_map['width']}x{current_map['height']}, "
                           f"分辨率: {current_map['resolution']:.2f}m/cell")
+                
+                # 检查位姿发布状态
+                if hasattr(self.robot_controller, 'last_pose_publish_time'):
+                    pose_age = current_time - self.robot_controller.last_pose_publish_time
+                    print(f"位姿发布状态: 最后发布 {pose_age:.1f}秒前")
             
             # 短暂延时
             time.sleep(0.01)
