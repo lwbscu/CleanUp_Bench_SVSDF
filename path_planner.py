@@ -37,14 +37,26 @@ class SLAMPathPlanner:
     
     def update_slam_map(self, map_data: Dict):
         """更新SLAM地图数据"""
-        self.slam_map = map_data['data']
+        # 关键修复：确保slam_map是numpy数组而不是列表
+        map_data_raw = map_data['data']
+        if isinstance(map_data_raw, list):
+            # 如果是1D列表，重新reshape为2D numpy数组
+            map_width = map_data['width']
+            map_height = map_data['height']
+            self.slam_map = np.array(map_data_raw).reshape(map_height, map_width)
+            print(f"SLAM地图数据从列表转换为numpy数组: {map_width}x{map_height}")
+        else:
+            # 如果已经是numpy数组，直接使用
+            self.slam_map = np.array(map_data_raw)
+            
         self.slam_map_width = map_data['width']
         self.slam_map_height = map_data['height']
         self.slam_map_resolution = map_data['resolution']
         self.slam_map_origin = map_data['origin']
         
         print(f"SLAM地图更新: {self.slam_map_width}x{self.slam_map_height}, "
-              f"分辨率: {self.slam_map_resolution:.3f}m/cell")
+              f"分辨率: {self.slam_map_resolution:.3f}m/cell, 数据类型: {type(self.slam_map)}")
+        print(f"SLAM地图形状: {self.slam_map.shape}")
     
     def generate_slam_based_coverage_path(self, start_pos: np.ndarray, slam_map: Dict) -> List[CoveragePoint]:
         """基于SLAM地图生成覆盖路径"""

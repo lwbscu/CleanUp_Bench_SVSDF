@@ -58,7 +58,7 @@ class LidarAvoidanceController:
         scan.angle_max = math.pi
         scan.angle_increment = math.radians(1.0)
         scan.range_min = 0.1
-        scan.range_max = 10.0
+        scan.range_max = 100
         scan.time_increment = 0.0
         scan.scan_time = 0.1
         

@@ -14,6 +14,7 @@ import math
 import rospy
 import subprocess
 import os
+import signal  # 修复：添加signal导入以支持进程终止操作
 from typing import List, Dict
 
 def print_memory_usage(stage_name: str = ""):

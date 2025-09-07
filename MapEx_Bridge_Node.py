@@ -278,67 +278,36 @@ class MapExBridgeNode:
                 print("发送探索命令失败，MapEx连接异常")
     
     def _send_to_mapex(self, message):
-        """发送消息到MapEx - 彻底修复缓冲区问题"""
+        """发送消息到MapEx - 使用长度头协议"""
         if not self.mapex_connected or not self.mapex_client_socket:
             return False
         
         try:
-            # 关键修复：根据消息类型采用不同策略
             msg_type = message.get('type', 'unknown')
             data = json.dumps(message).encode('utf-8')
+            data_size = len(data)
             
-            # 对于关键消息（速度命令、探索命令），使用阻塞发送确保送达
-            if msg_type in ['velocity_command', 'start_exploration', 'force_exploration']:
-                try:
-                    # 设置较短的发送超时，避免长时间阻塞
-                    self.mapex_client_socket.settimeout(0.5)  # 500ms超时
-                    self.mapex_client_socket.send(data + b'\n')
-                    
-                    # 成功发送关键消息
-                    if msg_type == 'velocity_command':
-                        vel_data = message.get('data', {})
-                        print(f"🚀 关键速度命令已发送: linear={vel_data.get('linear_x', 0):.3f}, angular={vel_data.get('angular_z', 0):.3f}")
-                    else:
-                        print(f"✓ 关键消息已发送: {msg_type}")
-                    
-                    return True
-                    
-                except socket.timeout:
-                    print(f"❌ 关键消息发送超时: {msg_type}")
-                    return False
-                except Exception as e:
-                    print(f"❌ 关键消息发送失败: {msg_type}, 错误: {e}")
-                    return False
+            print(f"📤 发送消息类型: {msg_type}, JSON大小: {data_size} 字节")
             
-            # 对于非关键消息（地图、位姿），使用非阻塞发送，失败时直接跳过
-            else:
-                try:
-                    self.mapex_client_socket.setblocking(False)
-                    self.mapex_client_socket.send(data + b'\n')
-                    return True
-                except BlockingIOError:
-                    # 非关键消息被跳过，这是正常的
-                    if msg_type not in ['map_update', 'robot_pose']:
-                        print(f"⚠️ 非关键消息跳过: {msg_type}")
-                    return False
-                except Exception as e:
-                    print(f"❌ 非关键消息发送失败: {msg_type}")
-                    return False
+            # 关键修复：发送长度头 + 数据
+            # 格式：4字节长度头 + JSON数据
+            length_header = data_size.to_bytes(4, byteorder='big')
+            
+            self.mapex_client_socket.settimeout(5.0)  # 增加超时时间
+            
+            # 先发送长度头
+            self.mapex_client_socket.sendall(length_header)
+            # 再发送完整数据
+            self.mapex_client_socket.sendall(data)
+            
+            print(f"✅ 消息发送成功: {msg_type} (头部4字节 + 数据{data_size}字节)")
+            return True
             
         except Exception as e:
-            print(f"❌ 发送消息到MapEx时出现异常: {e}")
+            print(f"❌ 发送失败: {msg_type}, 错误: {e}")
             self.mapex_connected = False
-            self.auto_start_conditions['mapex_connected'] = False
             return False
-        finally:
-            # 恢复默认阻塞模式
-            try:
-                if self.mapex_client_socket:
-                    self.mapex_client_socket.setblocking(True)
-                    self.mapex_client_socket.settimeout(1.0)  # 恢复1秒默认超时
-            except:
-                pass
-    
+
     def _receive_mapex_commands(self):
         """接收MapEx的命令 - 修复超时问题"""
         if not self.mapex_connected or not self.mapex_client_socket:
@@ -454,87 +423,126 @@ class MapExBridgeNode:
             print(f"⚠️ 未知MapEx命令类型: {cmd_type}")
     
     def _send_queued_data_to_mapex(self):
-        """发送队列中的数据到MapEx - 优化频率"""
+        """发送队列中的数据到MapEx - 降低频率"""
         if not self.mapex_connected:
             return
         
         current_time = time.time()
         
-        # 关键修复：降低地图发送频率，避免Socket缓冲区溢出
+        # 大幅降低地图发送频率
         if (self.current_map and 
-            current_time - getattr(self, 'last_map_send_time', 0) > 0.5):  # 2Hz发送地图
+            current_time - getattr(self, 'last_map_send_time', 0) > 3.0):  # 改为3秒发送一次
+            
+            print(f"📤 准备发送地图数据...")
             
             map_message = {
                 'type': 'map_update',
                 'data': self.current_map
             }
+            
             success = self._send_to_mapex(map_message)
             if success:
                 self.last_map_send_time = current_time
+                print(f"✅ 地图数据发送完成")
+            else:
+                print(f"❌ 地图数据发送失败")
         
-        # 关键修复：降低位姿发送频率，但确保数据精度
-        if current_time - getattr(self, 'last_pose_send_time', 0) > 0.1:  # 10Hz发送位姿，提高频率
+        # 位姿数据保持较高频率
+        if current_time - getattr(self, 'last_pose_send_time', 0) > 0.5:  # 2Hz发送位姿
             pose_message = {
                 'type': 'robot_pose',
                 'data': {
-                    'x': float(self.robot_pose[0]),  # 确保精度
+                    'x': float(self.robot_pose[0]),
                     'y': float(self.robot_pose[1]),
                     'yaw': float(self.robot_pose[2])
                 },
-                'timestamp': current_time  # 添加时间戳
+                'timestamp': current_time
             }
             success = self._send_to_mapex(pose_message)
             if success:
                 self.last_pose_send_time = current_time
     
     def map_callback(self, msg: OccupancyGrid):
-        """地图更新回调 - 修复负值哈希问题"""
+        """地图更新回调 - 修复地图数据格式"""
         # 转换地图数据为MapEx可用格式
         width = msg.info.width
         height = msg.info.height
         resolution = msg.info.resolution
         origin = [msg.info.origin.position.x, msg.info.origin.position.y]
         
-        # 关键修复：检查地图是否有实质性变化
         current_time = time.time()
         
-        # 修复：正确处理包含负值的地图数据
+        # 关键修复：正确处理地图数据
         map_data_array = np.array(msg.data, dtype=np.int8)
-        map_hash = hash(map_data_array.tobytes())  # 使用numpy数组的tobytes()方法
         
-        # 避免发送相同的地图
-        if (hasattr(self, 'last_map_hash') and 
-            map_hash == self.last_map_hash and 
-            current_time - getattr(self, 'last_map_send_time', 0) < 1.0):
-            return  # 1秒内相同地图不重复发送
+        print(f"🔍 原始地图数据: 长度={len(msg.data)}, 预期={width*height}")
         
-        # 转换占用栅格数据
-        map_data = map_data_array.reshape((height, width))
+        # 检查数据长度是否正确
+        expected_length = width * height
+        if len(msg.data) != expected_length:
+            print(f"❌ 地图数据长度不匹配: 收到{len(msg.data)}, 期望{expected_length}")
+            return
         
+        # 将1D数据重塑为2D，然后再展平（确保格式正确）
+        try:
+            # Cartographer发送的是行优先的1D数组
+            map_data_2d = map_data_array.reshape((height, width))
+            
+            # 验证重塑是否正确
+            print(f"✅ 地图重塑成功: {map_data_2d.shape}")
+            
+            # 重新展平为列表（行优先）
+            map_data_list = map_data_2d.flatten().tolist()
+            
+            print(f"✅ 地图数据展平: {len(map_data_list)}个元素")
+            
+        except Exception as e:
+            print(f"❌ 地图数据重塑失败: {e}")
+            return
+        
+        # 构建地图消息
         self.current_map = {
             'width': width,
             'height': height,
             'resolution': resolution,
             'origin': origin,
-            'data': map_data.tolist()
+            'data': map_data_list  # 使用正确展平的数据
         }
+        
+        # 计算地图哈希（用于变化检测）
+        map_hash = hash(map_data_array.tobytes())
+        
+        # 避免发送相同的地图
+        if (hasattr(self, 'last_map_hash') and 
+            map_hash == self.last_map_hash and 
+            current_time - getattr(self, 'last_map_send_time', 0) < 1.0):
+            return
         
         self.last_map_update = current_time
         self.last_map_hash = map_hash
         self.map_received_count += 1
         
-        # 关键修复：标记地图接收状态
+        # 标记地图接收状态
         if not self.auto_start_conditions['map_received']:
             self.auto_start_conditions['map_received'] = True
-            print(f"首次收到地图数据: {width}x{height}, 分辨率: {resolution:.3f}m/cell")
+            print(f"首次接收地图数据: {width}x{height}, 分辨率: {resolution:.3f}m/cell")
+            
+            # 数据质量检查
+            unknown_count = np.sum(map_data_2d == -1)
+            free_count = np.sum((map_data_2d >= 0) & (map_data_2d <= 20))
+            occupied_count = np.sum(map_data_2d >= 80)
+            total_cells = width * height
+            
+            print(f"📊 地图统计:")
+            print(f"   未知区域: {unknown_count}/{total_cells} ({unknown_count/total_cells*100:.1f}%)")
+            print(f"   空闲区域: {free_count}/{total_cells} ({free_count/total_cells*100:.1f}%)")
+            print(f"   占用区域: {occupied_count}/{total_cells} ({occupied_count/total_cells*100:.1f}%)")
         
-        # 定期状态报告 - 降低频率
-        if self.map_received_count % 20 == 0:  # 每20次更新报告一次
-            # 计算地图完成度
-            unknown_count = np.sum(map_data == -1)
+        # 定期状态报告
+        if self.map_received_count % 20 == 0:
+            unknown_count = np.sum(map_data_2d == -1)
             total_cells = width * height
             known_ratio = (total_cells - unknown_count) / total_cells if total_cells > 0 else 0
-            
             print(f"地图更新计数: {self.map_received_count}, 已知区域: {known_ratio:.1%}")
     
     def robot_pose_callback(self, msg: Float32MultiArray):
