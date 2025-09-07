@@ -431,8 +431,8 @@ class MapExBridgeNode:
         
         # 大幅降低地图发送频率
         if (self.current_map and 
-            current_time - getattr(self, 'last_map_send_time', 0) > 3.0):  # 改为3秒发送一次
-            
+            current_time - getattr(self, 'last_map_send_time', 0) > 0.5):  # 改为0.5秒发送一次
+
             print(f"📤 准备发送地图数据...")
             
             map_message = {

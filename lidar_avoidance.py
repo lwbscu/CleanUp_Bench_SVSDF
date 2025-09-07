@@ -21,9 +21,9 @@ class LidarAvoidanceController:
     
     def __init__(self):
         self.min_scan_range = 0.5
-        self.danger_distance = 0.6
-        self.warning_distance = 0.65
-        self.safe_distance = 0.8
+        self.danger_distance = 0.8  # 适度减小，避免过度保守
+        self.warning_distance = 1.0  # 适度减小
+        self.safe_distance = 1.2    # 适度减小
         self.danger_speed_factor = 0.0
         self.warning_speed_factor = 0.3
         self.safe_speed_factor = 0.8
@@ -34,7 +34,7 @@ class LidarAvoidanceController:
         self.avoidance_mode = "NORMAL"
         self.preferred_direction = None
         self.last_distance_output_time = rospy.Time.now()
-        self.distance_output_interval = 10.0
+        self.distance_output_interval = 30.0  # 增加到30秒输出一次，减少调试信息
         
         self.laser_sub = rospy.Subscriber('/robot_lidar_pointcloud', PointCloud2, 
                                         self.pointcloud_callback, queue_size=1)

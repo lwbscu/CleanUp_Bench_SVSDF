@@ -88,8 +88,8 @@ class SLAMRobotController:
             # 步进物理仿真
             self.world.step(render=True)
             
-            # 周期性进度报告
-            if step_count % 500 == 0:
+            # 周期性进度报告 - 减少输出频率
+            if step_count % 5000 == 0:  # 从500改为5000，减少10倍输出
                 progress = max(0, (start_distance - pos_error) / start_distance * 100)
                 print(f"  导航中... 距离: {pos_error:.3f}m, 进度: {progress:.1f}%, 步数: {step_count}")
         
@@ -119,8 +119,8 @@ class SLAMRobotController:
                 if success:
                     self.last_pose_publish_time = current_time
                     
-                    # 定期打印调试信息
-                    if int(current_time) % 5 == 0 and current_time - self.last_pose_publish_time < 0.1:
+                    # 定期打印调试信息 - 减少输出频率
+                    if int(current_time) % 50 == 0 and current_time - self.last_pose_publish_time < 0.1:  # 从5秒改为50秒
                         print(f"位姿发布成功: [{position[0]:.3f}, {position[1]:.3f}], yaw: {np.degrees(yaw):.1f}°")
                 else:
                     print("位姿发布失败: socket连接问题")
