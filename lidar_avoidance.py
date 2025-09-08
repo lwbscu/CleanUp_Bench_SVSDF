@@ -21,9 +21,10 @@ class LidarAvoidanceController:
     
     def __init__(self):
         self.min_scan_range = 0.5
-        self.danger_distance = 0.8  # 适度减小，避免过度保守
-        self.warning_distance = 1.0  # 适度减小
-        self.safe_distance = 1.2    # 适度减小
+        # 🔧 大幅缩短避障距离，避免过早触发
+        self.danger_distance = 0.6   # 真正危险距离：0.6米，紧急避障
+        self.warning_distance = 0.7  # 警告距离：0.7米，开始减速
+        self.safe_distance = 0.8     # 安全距离：0.8米，轻微调整
         self.danger_speed_factor = 0.0
         self.warning_speed_factor = 0.3
         self.safe_speed_factor = 0.8
@@ -32,9 +33,12 @@ class LidarAvoidanceController:
         self.current_scan = None
         self.last_scan_time = rospy.Time.now()
         self.avoidance_mode = "NORMAL"
-        self.preferred_direction = None
+        self.preferred_direction = None  # 记住避障方向，避免摆动
         self.last_distance_output_time = rospy.Time.now()
-        self.distance_output_interval = 30.0  # 增加到30秒输出一次，减少调试信息
+        self.distance_output_interval = 30.0
+        # 🔧 添加避障方向记忆，防止摆动
+        self.avoidance_direction_memory = None
+        self.avoidance_memory_timeout = rospy.Time.now()
         
         self.laser_sub = rospy.Subscriber('/robot_lidar_pointcloud', PointCloud2, 
                                         self.pointcloud_callback, queue_size=1)
@@ -283,28 +287,66 @@ class LidarAvoidanceController:
             return 0.0
     
     def _update_avoidance_mode(self, front_dist: float, left_dist: float, right_dist: float):
-        """更新避障模式和偏好方向"""
+        """更新避障模式和偏好方向 - 智能版本"""
         min_dist = min(front_dist, left_dist, right_dist)
         
-        # 确定避障模式
-        if min_dist < self.danger_distance:
+        # 🔧 智能避障决策：只在真正需要时避障
+        if min_dist < self.danger_distance:  # 0.5米内：紧急避障
             self.avoidance_mode = "DANGER"
-        elif min_dist < self.warning_distance:
+            # 🎯 智能方向选择：选择更远的一侧，避免摆动
+            self._select_smart_avoidance_direction(front_dist, left_dist, right_dist)
+        elif min_dist < self.warning_distance:  # 0.5-0.8米：警告模式
             self.avoidance_mode = "WARNING"
+            # 只有前方有障碍物时才调整方向
+            if front_dist < self.warning_distance:
+                self._select_smart_avoidance_direction(front_dist, left_dist, right_dist)
+            else:
+                self.preferred_direction = None  # 侧面障碍物不干扰前进
         else:
+            # 1米以外：正常模式，不进行避障
             self.avoidance_mode = "NORMAL"
+            self.preferred_direction = None
+            # 清除避障记忆，允许重新选择方向
+            if (rospy.Time.now() - self.avoidance_memory_timeout).to_sec() > 2.0:
+                self.avoidance_direction_memory = None
+
+    def _select_smart_avoidance_direction(self, front_dist: float, left_dist: float, right_dist: float):
+        """智能选择避障方向：选择更安全的一侧，避免左右摆动"""
+        current_time = rospy.Time.now()
         
-        # 确定偏好转向方向（远离最近障碍物）
-        if front_dist < self.warning_distance:
+        # 🔧 方向记忆机制：避免频繁切换方向
+        if (self.avoidance_direction_memory is not None and 
+            (current_time - self.avoidance_memory_timeout).to_sec() < 3.0):
+            # 3秒内保持相同的避障方向，除非该方向变得危险
+            if self.avoidance_direction_memory == "LEFT" and left_dist > self.danger_distance:
+                self.preferred_direction = "LEFT"
+                return
+            elif self.avoidance_direction_memory == "RIGHT" and right_dist > self.danger_distance:
+                self.preferred_direction = "RIGHT"
+                return
+        
+        # 🎯 智能选择：距离差异要明显才改变方向
+        distance_diff = abs(left_dist - right_dist)
+        
+        if distance_diff > 0.3:  # 距离差异>30cm才切换方向
             if left_dist > right_dist:
                 self.preferred_direction = "LEFT"
+                self.avoidance_direction_memory = "LEFT"
             else:
                 self.preferred_direction = "RIGHT"
+                self.avoidance_direction_memory = "RIGHT"
+            self.avoidance_memory_timeout = current_time
         else:
-            self.preferred_direction = None
+            # 距离相近时，保持当前记忆方向或选择左侧（默认）
+            if self.avoidance_direction_memory:
+                self.preferred_direction = self.avoidance_direction_memory
+            else:
+                self.preferred_direction = "LEFT"  # 默认左转
+                self.avoidance_direction_memory = "LEFT"
+                self.avoidance_memory_timeout = current_time
     
-    def get_avoidance_velocity_adjustment(self, target_linear: float, target_angular: float) -> Tuple[float, float]:
-        """根据避障模式调整目标速度"""
+    def get_avoidance_adjustment(self, target_linear: float, target_angular: float) -> Tuple[float, float]:
+        """根据避障模式调整目标速度 - 减少不必要避障"""
         if self.current_scan is None:
             return target_linear, target_angular
         
@@ -317,23 +359,29 @@ class LidarAvoidanceController:
         adjusted_angular = target_angular
         
         if self.avoidance_mode == "DANGER":
-            # 危险模式：停止前进，快速转向
-            adjusted_linear = target_linear * self.danger_speed_factor
+            # 危险模式：大动作快速避障，不犹豫
+            adjusted_linear = 0.0  # 停止前进
             if self.preferred_direction == "LEFT":
-                adjusted_angular = abs(target_angular) + 0.5
+                adjusted_angular = 1.0  # 快速左转
             elif self.preferred_direction == "RIGHT":
-                adjusted_angular = -abs(target_angular) - 0.5
+                adjusted_angular = -1.0  # 快速右转
+            else:
+                adjusted_angular = 1.0  # 默认左转
             
         elif self.avoidance_mode == "WARNING":
-            # 警告模式：减速并调整方向
-            adjusted_linear = target_linear * self.warning_speed_factor
-            if self.preferred_direction == "LEFT":
-                adjusted_angular = target_angular + 0.3
-            elif self.preferred_direction == "RIGHT":
-                adjusted_angular = target_angular - 0.3
+            # 警告模式：只在前方有障碍物时才调整
+            if self.preferred_direction:
+                adjusted_linear = target_linear * 0.5  # 减速但继续前进
+                if self.preferred_direction == "LEFT":
+                    adjusted_angular = target_angular + 0.5
+                elif self.preferred_direction == "RIGHT":
+                    adjusted_angular = target_angular - 0.5
+            else:
+                # 侧面障碍物不影响前进
+                adjusted_linear = target_linear
+                adjusted_angular = target_angular
                 
-        else:  # NORMAL模式
-            adjusted_linear = target_linear * self.safe_speed_factor
+        # NORMAL模式：不进行任何避障调整，让机器人自由移动
         
         # 限制速度范围
         adjusted_linear = np.clip(adjusted_linear, 0.0, MAX_LINEAR_VELOCITY)
