@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 修复版MapEx桥接节点 - 自动启动探索并确保正确通信
+增加RViz目标点可视化功能
 """
 
 import rospy
@@ -12,10 +13,11 @@ import subprocess
 import os
 import signal
 import numpy as np
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Bool, String, Float32MultiArray
+from std_msgs.msg import Bool, String, Float32MultiArray, ColorRGBA
 from sensor_msgs.msg import PointCloud2
+from visualization_msgs.msg import Marker, MarkerArray
 
 class MapExBridgeNode:
     """修复版MapEx桥接节点 - 自动探索启动"""
@@ -41,6 +43,11 @@ class MapExBridgeNode:
         self.exploration_done_pub = rospy.Publisher('/exploration_done', Bool, queue_size=10)
         self.mapex_goal_pub = rospy.Publisher('/mapex/goal', Float32MultiArray, queue_size=10)
         
+        # 可视化发布器
+        self.goal_marker_pub = rospy.Publisher('/mapex/goal_markers', Marker, queue_size=10)  # 改为Marker
+        self.current_goal_pub = rospy.Publisher('/mapex/current_goal', PoseStamped, queue_size=10)
+        self.goal_reached_pub = rospy.Publisher('/mapex/goal_reached', PoseStamped, queue_size=10)  # 改为PoseStamped
+        
         # ROS订阅器
         self.map_sub = rospy.Subscriber('/map', OccupancyGrid, self.map_callback, queue_size=1)
         self.lidar_sub = rospy.Subscriber('/robot_lidar_pointcloud', PointCloud2, self.lidar_callback, queue_size=1)
@@ -53,6 +60,14 @@ class MapExBridgeNode:
         self.last_map_update = time.time()
         self.map_received_count = 0
         self.pose_received_count = 0
+        
+        # 目标点可视化相关变量
+        self.current_goal = None  # 当前目标点 [x, y, yaw]
+        self.goal_history = []  # 历史目标点
+        self.goal_id_counter = 0  # 目标点ID计数器
+        self.goal_reached_threshold = 0.3  # 到达目标的距离阈值（米）
+        self.last_goal_check_time = time.time()
+        self.goal_marker_lifetime = rospy.Duration(30.0)  # 标记生存时间
         
         # 关键修复：自动启动探索的条件
         self.auto_start_enabled = True
@@ -404,7 +419,11 @@ class MapExBridgeNode:
             goal_msg = Float32MultiArray()
             goal_msg.data = [data.get('x', 0.0), data.get('y', 0.0), data.get('yaw', 0.0)]
             self.mapex_goal_pub.publish(goal_msg)
-            print(f"MapEx请求目标: [{data.get('x', 0.0):.2f}, {data.get('y', 0.0):.2f}]")
+            
+            # 更新当前目标并可视化
+            new_goal = [data.get('x', 0.0), data.get('y', 0.0), data.get('yaw', 0.0)]
+            self._update_current_goal(new_goal)
+            print(f"MapEx请求目标: [{new_goal[0]:.2f}, {new_goal[1]:.2f}]")
             
         elif cmd_type == 'heartbeat':
             # 心跳响应
@@ -419,9 +438,313 @@ class MapExBridgeNode:
             frontier_count = data.get('frontier_count', 0)
             print(f"MapEx前沿检测: 发现{frontier_count}个前沿区域")
         
+        elif cmd_type == 'new_goal':
+            # MapEx发送新的探索目标
+            data = command.get('data', {})
+            new_goal = [data.get('x', 0.0), data.get('y', 0.0), data.get('yaw', 0.0)]
+            self._update_current_goal(new_goal)
+            print(f"📍 MapEx设定新目标: [{new_goal[0]:.2f}, {new_goal[1]:.2f}], yaw={np.degrees(new_goal[2]):.1f}°")
+        
+        elif cmd_type == 'goal_reached':
+            # MapEx报告目标已到达
+            if self.current_goal:
+                self._mark_goal_as_reached()
+                print(f"🎯 目标已到达: [{self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}]")
+        
         else:
             print(f"⚠️ 未知MapEx命令类型: {cmd_type}")
     
+    def _update_current_goal(self, new_goal):
+        """更新当前目标并发布RViz可视化标记"""
+        if not new_goal or len(new_goal) < 2:
+            print("⚠️ 无效的目标坐标")
+            return
+        
+        # 🔧 修复：验证目标坐标合理性
+        x, y = new_goal[0], new_goal[1]
+        
+        # 检查坐标是否在合理范围内（±20米）
+        if abs(x) > 20.0 or abs(y) > 20.0:
+            print(f"⚠️ 目标坐标超出合理范围: ({x:.2f}, {y:.2f}), 可能存在坐标转换错误")
+            # 不直接返回，仍然发布，但给出警告
+        
+        # 检查坐标是否为NaN或无穷大
+        if not (np.isfinite(x) and np.isfinite(y)):
+            print(f"❌ 目标坐标包含无效值: ({x}, {y})")
+            return
+        
+        # 🔧 修复：先清除旧目标标记
+        if self.current_goal is not None:
+            print(f"🧹 清除旧目标: ID={self.goal_id_counter}")
+            self._clear_goal_markers()
+            
+            # 保存旧目标到历史
+            self.goal_history.append({
+                'goal': self.current_goal.copy(),
+                'timestamp': time.time(),
+                'status': 'replaced'
+            })
+        
+        # 设置新目标并递增ID
+        self.current_goal = new_goal
+        self.goal_id_counter += 1
+        
+        # 发布新目标的可视化
+        self._publish_current_goal(new_goal)
+        self._publish_goal_marker(new_goal)
+        
+        print(f"✅ 目标已更新: ID={self.goal_id_counter}, pos=[{new_goal[0]:.2f}, {new_goal[1]:.2f}]")
+    
+    def _mark_goal_as_reached(self):
+        """标记目标为已到达并清除可视化"""
+        if not self.current_goal:
+            return
+        
+        # 添加到历史记录
+        self.goal_history.append({
+            'goal': self.current_goal.copy(),
+            'timestamp': time.time(),
+            'status': 'reached'
+        })
+        
+        # 发布目标到达消息
+        self._publish_goal_reached(self.current_goal)
+        
+        # 清除当前目标
+        self.current_goal = None
+        
+        # 清除RViz中的目标标记
+        self._clear_goal_markers()
+        
+        print(f"🎯 目标到达确认，标记已清除")
+    
+    def _publish_current_goal(self, goal):
+        """发布当前目标位置"""
+        try:
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = rospy.Time.now()
+            pose_msg.header.frame_id = "map"
+            
+            pose_msg.pose.position.x = float(goal[0])
+            pose_msg.pose.position.y = float(goal[1])
+            pose_msg.pose.position.z = 0.0
+            
+            # 设置朝向（如果提供了yaw角）
+            if len(goal) > 2:
+                yaw = goal[2]
+                pose_msg.pose.orientation.z = np.sin(yaw / 2.0)
+                pose_msg.pose.orientation.w = np.cos(yaw / 2.0)
+            else:
+                pose_msg.pose.orientation.w = 1.0
+            
+            self.current_goal_pub.publish(pose_msg)
+            
+            print(f"✅ 当前目标位置已发布: [{goal[0]:.2f}, {goal[1]:.2f}]")
+            
+        except Exception as e:
+            print(f"⚠️ 发布当前目标失败: {e}")
+    
+    def _publish_goal_marker(self, goal):
+        """发布目标可视化标记"""
+        try:
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = "mapex_goals"
+            marker.id = self.goal_id_counter
+            marker.type = Marker.ARROW
+            marker.action = Marker.ADD
+            
+            # 设置位置
+            marker.pose.position.x = float(goal[0])
+            marker.pose.position.y = float(goal[1])
+            marker.pose.position.z = 0.2  # 稍微抬高一点
+            
+            # 设置朝向
+            if len(goal) > 2:
+                yaw = goal[2]
+                marker.pose.orientation.z = np.sin(yaw / 2.0)
+                marker.pose.orientation.w = np.cos(yaw / 2.0)
+            else:
+                marker.pose.orientation.w = 1.0
+            
+            # 设置大小
+            marker.scale.x = 0.5  # 箭头长度
+            marker.scale.y = 0.1  # 箭头宽度
+            marker.scale.z = 0.1  # 箭头高度
+            
+            # 设置颜色 - 亮绿色
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 0.8
+            
+            # 设置持续时间
+            marker.lifetime = rospy.Duration(0)  # 永久显示，直到手动删除
+            
+            self.goal_marker_pub.publish(marker)
+            
+            # 同时发布文字标签
+            self._publish_goal_text(goal, self.goal_id_counter)
+            
+            print(f"✅ 目标标记已发布: 箭头 + 文字, ID={self.goal_id_counter}")
+            
+        except Exception as e:
+            print(f"⚠️ 发布目标标记失败: {e}")
+    
+    def _publish_goal_text(self, goal, goal_id):
+        """发布目标文字标签"""
+        try:
+            text_marker = Marker()
+            text_marker.header.frame_id = "map"
+            text_marker.header.stamp = rospy.Time.now()
+            text_marker.ns = "mapex_goal_text"
+            text_marker.id = goal_id
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            
+            # 文字位置（在目标点上方）
+            text_marker.pose.position.x = float(goal[0])
+            text_marker.pose.position.y = float(goal[1])
+            text_marker.pose.position.z = 0.5
+            text_marker.pose.orientation.w = 1.0
+            
+            # 文字内容
+            text_marker.text = f"Goal-{goal_id}\n({goal[0]:.1f}, {goal[1]:.1f})"
+            
+            # 文字大小
+            text_marker.scale.z = 0.2
+            
+            # 文字颜色 - 白色
+            text_marker.color.r = 1.0
+            text_marker.color.g = 1.0
+            text_marker.color.b = 1.0
+            text_marker.color.a = 1.0
+            
+            self.goal_marker_pub.publish(text_marker)
+            
+            print(f"✅ 目标文字标签已发布: Goal-{goal_id}")
+            
+        except Exception as e:
+            print(f"⚠️ 发布目标文字失败: {e}")
+    
+    def _publish_goal_reached(self, goal):
+        """发布目标到达消息"""
+        try:
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = rospy.Time.now()
+            pose_msg.header.frame_id = "map"
+            
+            pose_msg.pose.position.x = float(goal[0])
+            pose_msg.pose.position.y = float(goal[1])
+            pose_msg.pose.position.z = 0.0
+            
+            if len(goal) > 2:
+                yaw = goal[2]
+                pose_msg.pose.orientation.z = np.sin(yaw / 2.0)
+                pose_msg.pose.orientation.w = np.cos(yaw / 2.0)
+            else:
+                pose_msg.pose.orientation.w = 1.0
+            
+            self.goal_reached_pub.publish(pose_msg)
+            print(f"✅ 目标到达消息已发布: [{goal[0]:.2f}, {goal[1]:.2f}]")
+            
+        except Exception as e:
+            print(f"⚠️ 发布目标到达消息失败: {e}")
+    
+    def _clear_goal_markers(self):
+        """清除所有目标标记"""
+        try:
+            # 清除当前目标的箭头标记
+            clear_marker = Marker()
+            clear_marker.header.frame_id = "map"
+            clear_marker.header.stamp = rospy.Time.now()
+            clear_marker.ns = "mapex_goals"
+            clear_marker.id = self.goal_id_counter
+            clear_marker.action = Marker.DELETE
+            self.goal_marker_pub.publish(clear_marker)
+            
+            # 清除当前目标的文字标记
+            clear_text = Marker()
+            clear_text.header.frame_id = "map"
+            clear_text.header.stamp = rospy.Time.now()
+            clear_text.ns = "mapex_goal_text"
+            clear_text.id = self.goal_id_counter
+            clear_text.action = Marker.DELETE
+            self.goal_marker_pub.publish(clear_text)
+            
+            # 🔧 修复：清除所有历史标记（防止遗留）
+            # 清除最近5个ID的标记，确保没有遗留
+            for old_id in range(max(1, self.goal_id_counter - 4), self.goal_id_counter):
+                if old_id != self.goal_id_counter:  # 避免重复清除当前ID
+                    # 清除旧箭头标记
+                    old_marker = Marker()
+                    old_marker.header.frame_id = "map"
+                    old_marker.header.stamp = rospy.Time.now()
+                    old_marker.ns = "mapex_goals"
+                    old_marker.id = old_id
+                    old_marker.action = Marker.DELETE
+                    self.goal_marker_pub.publish(old_marker)
+                    
+                    # 清除旧文字标记
+                    old_text = Marker()
+                    old_text.header.frame_id = "map"
+                    old_text.header.stamp = rospy.Time.now()
+                    old_text.ns = "mapex_goal_text"
+                    old_text.id = old_id
+                    old_text.action = Marker.DELETE
+                    self.goal_marker_pub.publish(old_text)
+            
+            print(f"✅ 目标标记已清除: 当前ID={self.goal_id_counter} + 历史标记")
+            
+        except Exception as e:
+            print(f"⚠️ 清除目标标记失败: {e}")
+    
+    def publish_test_goal(self, x=2.0, y=1.5, yaw=0.0):
+        """测试函数：发布一个测试目标点"""
+        test_goal = [x, y, yaw]
+        self._update_current_goal(test_goal)
+        print(f"🧪 发布测试目标: [{x}, {y}], yaw={np.degrees(yaw)}°")
+    
+    def get_goal_history(self):
+        """获取目标历史记录"""
+        return self.goal_history
+    
+    def clear_goal_history(self):
+        """清除目标历史记录"""
+        self.goal_history.clear()
+        print("🗑️ 目标历史已清除")
+    
+    def _publish_test_goal_for_debug(self):
+        """调试功能：发布测试目标来验证可视化系统"""
+        if not self.mapex_connected:
+            return
+        
+        import random
+        
+        # 🔧 修复：生成更合理范围的测试目标（室内环境）
+        test_x = random.uniform(-5.0, 5.0)   # 限制在±5米范围内
+        test_y = random.uniform(-5.0, 5.0)   # 限制在±5米范围内
+        test_yaw = random.uniform(-np.pi, np.pi)
+        
+        test_goal = [test_x, test_y, test_yaw]
+        self._update_current_goal(test_goal)
+        
+        print(f"🧪 [调试] 发布测试目标: [{test_x:.2f}, {test_y:.2f}], yaw={np.degrees(test_yaw):.1f}°")
+        print(f"📊 [调试] 当前目标历史数量: {len(self.goal_history)}")
+        
+        # 模拟3秒后目标到达
+        def mark_reached():
+            time.sleep(3.0)
+            if self.current_goal and self.current_goal == test_goal:
+                self._mark_goal_as_reached()
+                print(f"🎯 [调试] 测试目标已模拟到达")
+        
+        # 启动模拟到达线程
+        reach_thread = threading.Thread(target=mark_reached)
+        reach_thread.daemon = True
+        reach_thread.start()
+
     def _send_queued_data_to_mapex(self):
         """发送队列中的数据到MapEx - 降低频率"""
         if not self.mapex_connected:
@@ -639,9 +962,12 @@ class MapExBridgeNode:
         # 主循环
         rate = rospy.Rate(10)  # 10Hz
         last_status_time = time.time()
+        last_test_goal_time = time.time()
         
         try:
             while not rospy.is_shutdown() and self.running:
+                current_time = time.time()
+                
                 # 关键修复：检查服务器线程状态
                 if not self.server_thread.is_alive():
                     print("❌ Socket服务器线程已停止，尝试重启...")
@@ -649,10 +975,16 @@ class MapExBridgeNode:
                     self.server_thread.daemon = True
                     self.server_thread.start()
                 
+                # 🧪 调试功能：定期发布测试目标验证可视化系统
+                if (self.mapex_connected and 
+                    current_time - last_test_goal_time > 20.0):  # 每20秒发布一个测试目标
+                    self._publish_test_goal_for_debug()
+                    last_test_goal_time = current_time
+                
                 # 定期打印状态摘要
-                if time.time() - last_status_time > 15.0:
+                if current_time - last_status_time > 15.0:
                     self.print_status_summary()
-                    last_status_time = time.time()
+                    last_status_time = current_time
                 
                 rate.sleep()
                 
@@ -689,3 +1021,38 @@ if __name__ == '__main__':
         print(f"MapEx桥接节点出错: {e}")
         import traceback
         traceback.print_exc()
+
+"""
+RViz目标可视化功能说明：
+
+1. 目标发布话题：
+   - /mapex/current_goal: 当前活跃的目标点 (PoseStamped)
+   - /mapex/goal_markers: 目标的可视化标记 (Marker)
+   - /mapex/goal_reached: 已到达的目标点 (PoseStamped)
+
+2. RViz配置：
+   在RViz中添加以下显示类型：
+   - Marker: 订阅 /mapex/goal_markers 显示目标箭头和文字
+   - PoseStamped: 订阅 /mapex/current_goal 显示目标位置
+
+3. 目标生命周期：
+   - 新目标: MapEx发送 'new_goal' 命令 → 显示绿色箭头和标签
+   - 目标到达: MapEx发送 'goal_reached' 命令 → 清除可视化标记
+   - 目标替换: 新目标自动替换旧目标
+
+4. 测试命令：
+   在Python中可以调用:
+   bridge.publish_test_goal(x=2.0, y=1.5, yaw=0.0)  # 发布测试目标
+   bridge.get_goal_history()  # 查看目标历史
+   bridge.clear_goal_history()  # 清除历史记录
+
+5. MapEx集成：
+   MapEx需要发送以下格式的命令：
+   {
+     "type": "new_goal",
+     "data": {"x": 2.0, "y": 1.5, "yaw": 0.0}
+   }
+   {
+     "type": "goal_reached"
+   }
+"""
