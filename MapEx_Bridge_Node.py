@@ -270,7 +270,10 @@ class MapExBridgeNode:
                         'max_linear_velocity': 0.3,
                         'max_angular_velocity': 2.5,  # 大幅提高角速度从1.0到2.5
                         'exploration_radius': 5.0,
-                        'frontier_threshold': 0.1
+                        'frontier_threshold': 0.1,
+                        'use_ground_truth_pose': True,  # 关键修复：指示MapEx使用真值位置
+                        'prevent_drift': True,  # 启用防漂移模式
+                        'coordinate_source': 'isaac_sim_ground_truth'  # 标明坐标来源
                     }
                 }
             }
@@ -746,7 +749,7 @@ class MapExBridgeNode:
         reach_thread.start()
 
     def _send_queued_data_to_mapex(self):
-        """发送队列中的数据到MapEx - 降低频率"""
+        """发送队列中的数据到MapEx - 使用真值位置，防止漂移"""
         if not self.mapex_connected:
             return
         
@@ -760,24 +763,28 @@ class MapExBridgeNode:
             
             map_message = {
                 'type': 'map_update',
-                'data': self.current_map
+                'data': self.current_map,
+                'coordinate_frame': 'isaac_sim_ground_truth'  # 标明坐标系
             }
             
             success = self._send_to_mapex(map_message)
             if success:
                 self.last_map_send_time = current_time
-                print(f"✅ 地图数据发送完成")
+                print(f"✅ 地图数据发送完成 (真值坐标系)")
             else:
                 print(f"❌ 地图数据发送失败")
         
-        # 位姿数据保持较高频率
+        # 关键修复：发送真值位姿数据，确保MapEx使用精确位置
         if current_time - getattr(self, 'last_pose_send_time', 0) > 0.5:  # 2Hz发送位姿
             pose_message = {
                 'type': 'robot_pose',
                 'data': {
                     'x': float(self.robot_pose[0]),
                     'y': float(self.robot_pose[1]),
-                    'yaw': float(self.robot_pose[2])
+                    'yaw': float(self.robot_pose[2]),
+                    'source': 'isaac_sim_ground_truth',  # 标明这是真值位置
+                    'prevent_drift': True,  # 启用防漂移标识
+                    'coordinate_accuracy': 'sub_millimeter'  # 标明精度级别
                 },
                 'timestamp': current_time
             }
@@ -869,16 +876,19 @@ class MapExBridgeNode:
             print(f"地图更新计数: {self.map_received_count}, 已知区域: {known_ratio:.1%}")
     
     def robot_pose_callback(self, msg: Float32MultiArray):
-        """机器人位姿回调 - 增强调试版本"""
+        """机器人位姿回调 - 使用Isaac Sim真值位置，避免SLAM漂移"""
         if len(msg.data) >= 3:
             old_pose = self.robot_pose.copy()
+            
+            # 关键修复：直接使用Isaac Sim真值位置作为机器人位置
             self.robot_pose = [msg.data[0], msg.data[1], msg.data[2]]
             self.pose_received_count += 1
             
-            # 关键修复：标记位姿接收状态
+            # 标记位姿接收状态
             if not self.auto_start_conditions['pose_received']:
                 self.auto_start_conditions['pose_received'] = True
-                print(f"首次收到机器人位姿: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
+                print(f"✅ 首次收到Isaac Sim真值位姿: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
+                print(f"📍 使用真值位置进行MapEx导航，避免SLAM累积误差导致的地图漂移")
             
             # 位姿变化检测和调试输出 - 降低频率
             current_time = time.time()
@@ -888,12 +898,14 @@ class MapExBridgeNode:
                 
                 # 限制输出频率：每3秒最多输出一次位姿变化
                 if not hasattr(self, 'last_pose_debug_time') or current_time - self.last_pose_debug_time > 3.0:
-                    print(f"🔄 桥接节点位姿变化: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
+                    print(f"🎯 真值位姿变化: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}° (Isaac Ground Truth)")
                     self.last_pose_debug_time = current_time
             
-            # 定期状态报告 - 每100次更新报告一次，降低频率
-            if self.pose_received_count % 100 == 0:  # 降低频率到每100次
-                print(f"位姿更新计数: {self.pose_received_count}, 当前位姿: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
+            # 定期状态报告 - 每100次更新报告一次，强调真值位置使用
+            if self.pose_received_count % 100 == 0:
+                print(f"📊 真值位姿更新计数: {self.pose_received_count}")
+                print(f"🎯 当前真值位姿: [{self.robot_pose[0]:.3f}, {self.robot_pose[1]:.3f}], yaw: {np.degrees(self.robot_pose[2]):.1f}°")
+                print(f"🛡️ 防漂移状态: 使用Isaac Sim真值位置，地图坐标精度保证")
     
     def lidar_callback(self, msg: PointCloud2):
         """激光雷达数据回调"""

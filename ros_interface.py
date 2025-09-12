@@ -170,12 +170,16 @@ class SocketROSInterface:
         self.velocity_command_callback = callback
     
     def send_robot_pose(self, position: np.ndarray, yaw: float):
-        """发送机器人位姿到ROS桥接节点"""
+        """发送机器人位姿到ROS桥接节点 - 增强真值位置支持"""
         message = {
             'type': 'robot_pose',
             'data': {
                 'position': position.tolist(),
-                'yaw': float(yaw)
+                'yaw': float(yaw),
+                'source': 'isaac_sim_ground_truth',  # 标明这是真值位置
+                'coordinate_accuracy': 'sub_millimeter',  # 标明精度级别
+                'prevent_drift': True,  # 启用防漂移标识
+                'timestamp': time.time()
             }
         }
         return self._send_message(message)

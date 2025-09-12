@@ -157,43 +157,114 @@ class IsaacSimROSBridge:
             })
     
     def handle_robot_pose_update(self, pose_data):
-        """关键修复：处理机器人位姿更新"""
+        """关键修复：处理Isaac Sim真值位姿更新并强制覆盖SLAM定位"""
         if not pose_data:
             return
             
         try:
-            # 提取位姿数据
+            # 提取Isaac Sim真值位姿数据
             position = pose_data.get('position', [0.0, 0.0, 0.0])
             yaw = pose_data.get('yaw', 0.0)
             
             # 数据验证：检查数值是否合理
             if (abs(position[0]) > 1000 or abs(position[1]) > 1000 or 
                 abs(position[2]) > 1000 or abs(yaw) > 10):
-                print(f"警告: 收到异常位姿数据: pos={position}, yaw={yaw}")
+                print(f"警告: 收到异常真值位姿数据: pos={position}, yaw={yaw}")
                 return
             
-            # 更新内部状态
+            # 更新内部状态为真值位置
             self.robot_pose = {
                 'position': position,
                 'yaw': yaw,
-                'timestamp': rospy.Time.now()
+                'timestamp': rospy.Time.now(),
+                'source': 'isaac_sim_ground_truth'  # 标记数据源
             }
             self.last_pose_time = rospy.Time.now()
             
-            # 发布TF变换
-            self.publish_robot_tf(position, yaw)
+            # 关键修复：强制发布真值TF变换，覆盖Cartographer的定位
+            self.publish_ground_truth_tf(position, yaw)
             
-            # 发布机器人位姿话题
+            # 发布真值机器人位姿话题
             self.publish_robot_pose_topic(position, yaw)
+            
+            # 关键修复：发布静态变换，将ground truth位置映射到标准frame
+            self.publish_ground_truth_to_base_link_transform(position, yaw)
             
             # 调试输出（每5秒一次）
             current_time = rospy.Time.now()
             if (current_time - getattr(self, 'last_debug_time', rospy.Time(0))).to_sec() > 5.0:
-                print(f"位姿更新: pos=[{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}], yaw={np.degrees(yaw):.1f}°")
+                print(f"✅ 真值位姿更新: pos=[{position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}], yaw={np.degrees(yaw):.1f}° (Isaac Ground Truth)")
                 self.last_debug_time = current_time
                 
         except Exception as e:
-            print(f"处理位姿更新时出错: {e}")
+            print(f"处理真值位姿更新时出错: {e}")
+    
+    def publish_ground_truth_tf(self, position, yaw):
+        """发布Isaac Sim真值TF变换"""
+        try:
+            # 创建真值TF变换消息
+            t = TransformStamped()
+            
+            # 设置坐标系 - 使用特殊的frame_id标识真值
+            t.header.stamp = rospy.Time.now()
+            t.header.frame_id = "map"
+            t.child_frame_id = "base_link_ground_truth"
+            
+            # 设置真值位置（直接使用Isaac Sim的精确坐标）
+            t.transform.translation.x = float(position[0])
+            t.transform.translation.y = float(position[1])
+            t.transform.translation.z = float(position[2])
+            
+            # 设置真值旋转（yaw角转四元数）
+            quaternion = transformations.quaternion_from_euler(0, 0, yaw)
+            t.transform.rotation.x = quaternion[0]
+            t.transform.rotation.y = quaternion[1]
+            t.transform.rotation.z = quaternion[2]
+            t.transform.rotation.w = quaternion[3]
+            
+            # 广播真值TF变换
+            self.tf_broadcaster.sendTransform(t)
+            
+        except Exception as e:
+            print(f"发布真值TF变换时出错: {e}")
+    
+    def publish_ground_truth_to_base_link_transform(self, position, yaw):
+        """发布从真值位置到标准base_link的变换，强制覆盖SLAM定位"""
+        try:
+            # 创建覆盖SLAM的TF变换
+            t = TransformStamped()
+            
+            # 关键修复：直接发布到标准的base_link frame，覆盖Cartographer
+            t.header.stamp = rospy.Time.now()
+            t.header.frame_id = "map"
+            t.child_frame_id = "base_link"  # 直接覆盖标准frame
+            
+            # 使用Isaac Sim的真值位置
+            t.transform.translation.x = float(position[0])
+            t.transform.translation.y = float(position[1])
+            t.transform.translation.z = float(position[2])
+            
+            # 使用Isaac Sim的真值朝向
+            quaternion = transformations.quaternion_from_euler(0, 0, yaw)
+            t.transform.rotation.x = quaternion[0]
+            t.transform.rotation.y = quaternion[1]
+            t.transform.rotation.z = quaternion[2]
+            t.transform.rotation.w = quaternion[3]
+            
+            # 强制广播，覆盖Cartographer的定位
+            self.tf_broadcaster.sendTransform(t)
+            
+            # 每10秒输出一次覆盖状态
+            current_time = rospy.Time.now()
+            if not hasattr(self, 'last_override_debug_time'):
+                self.last_override_debug_time = rospy.Time(0)
+            
+            if (current_time - self.last_override_debug_time).to_sec() > 10.0:
+                print(f"🔄 TF覆盖: Isaac真值位置覆盖SLAM定位，防止地图漂移")
+                self.last_override_debug_time = current_time
+            
+        except Exception as e:
+            print(f"发布TF覆盖变换时出错: {e}")
     
     def publish_robot_tf(self, position, yaw):
         """关键修复：发布正确的TF变换"""
