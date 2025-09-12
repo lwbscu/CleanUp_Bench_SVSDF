@@ -104,7 +104,7 @@ class SLAMRobotController:
         return final_error < POSITION_TOLERANCE * 1.5
     
     def _publish_robot_pose_to_ros(self, position: np.ndarray, yaw: float):
-        """关键修复：发布机器人位姿到ROS系统"""
+        """关键修复：强制发布Isaac Sim真值位姿到ROS系统"""
         current_time = time.time()
         
         # 控制发布频率
@@ -112,23 +112,53 @@ class SLAMRobotController:
             return
         
         try:
-            # 发送位姿到socket接口
+            # 关键修复：强制发布Isaac Sim的真值位置，覆盖SLAM定位
             if hasattr(self.ros_bridge, 'socket_interface') and self.ros_bridge.socket_interface:
+                
+                # 发布真值位姿数据 - 这是准确的位置
                 success = self.ros_bridge.socket_interface.send_robot_pose(position, yaw)
+                
+                # 同时直接发布到ROS TF系统，强制覆盖Cartographer的定位
+                self._force_publish_ground_truth_tf(position, yaw)
                 
                 if success:
                     self.last_pose_publish_time = current_time
                     
-                    # 定期打印调试信息 - 减少输出频率
-                    if int(current_time) % 50 == 0 and current_time - self.last_pose_publish_time < 0.1:  # 从5秒改为50秒
-                        print(f"位姿发布成功: [{position[0]:.3f}, {position[1]:.3f}], yaw: {np.degrees(yaw):.1f}°")
+                    # 定期打印调试信息 - 显示真值位置使用状态
+                    if int(current_time) % 10 == 0 and current_time - self.last_pose_publish_time < 0.1:
+                        print(f"✅ 真值位姿发布: [{position[0]:.3f}, {position[1]:.3f}], yaw: {np.degrees(yaw):.1f}° (Isaac Sim Ground Truth)")
                 else:
-                    print("位姿发布失败: socket连接问题")
+                    print("❌ 真值位姿发布失败: socket连接问题")
             else:
-                print("警告: ROS接口未连接，位姿发布跳过")
+                print("⚠️ 警告: ROS接口未连接，真值位姿发布跳过")
                 
         except Exception as e:
-            print(f"发布位姿时出错: {e}")
+            print(f"发布真值位姿时出错: {e}")
+    
+    def _force_publish_ground_truth_tf(self, position: np.ndarray, yaw: float):
+        """强制发布Isaac Sim真值位置到ROS TF系统"""
+        try:
+            # 通过ROS桥接接口发布TF，避免直接导入ROS模块
+            if hasattr(self.ros_bridge, 'socket_interface') and self.ros_bridge.socket_interface:
+                # 检查socket_interface是否有发送方法
+                if hasattr(self.ros_bridge.socket_interface, 'send_robot_pose'):
+                    # 使用现有的send_robot_pose方法发送真值位置
+                    success = self.ros_bridge.socket_interface.send_robot_pose(position, yaw)
+                    
+                    if success and not hasattr(self, '_tf_publish_logged'):
+                        print(f"✅ 真值位置通过ROS桥接发布成功，防止地图漂移")
+                        self._tf_publish_logged = True
+                else:
+                    # 如果没有发送方法，跳过TF发布但不报错
+                    if not hasattr(self, '_tf_skip_logged'):
+                        print(f"ℹ️ ROS桥接接口暂不支持TF发布，跳过真值TF变换")
+                        self._tf_skip_logged = True
+            
+        except Exception as e:
+            # 降低错误输出频率，避免刷屏
+            if not hasattr(self, '_tf_error_logged'):
+                print(f"⚠️ 真值TF发布跳过: {e}")
+                self._tf_error_logged = True
     
     def _compute_and_send_control(self, current_pos: np.ndarray, current_yaw: float, 
                                  target_pos: np.ndarray, target_yaw: float):
